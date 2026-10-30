@@ -1,0 +1,21 @@
+train:
+- /kaggle/working/Football-Detect-6/train/images
+- /kaggle/working/FutVAR-Football-Players-Detection-Dataset-2/train/images
+- /kaggle/working/footbal-1/train/images
+- /kaggle/working/football-players-detection-1/train/images
+val:
+- /kaggle/working/Football-Detect-6/valid/images
+- /kaggle/working/FutVAR-Football-Players-Detection-Dataset-2/valid/images
+- /kaggle/working/footbal-1/valid/images
+- /kaggle/working/football-players-detection-1/valid/images
+test:
+- /kaggle/working/Football-Detect-6/test/images
+- /kaggle/working/FutVAR-Football-Players-Detection-Dataset-2/test/images
+- /kaggle/working/footbal-1/test/images
+- /kaggle/working/football-players-detection-1/test/images
+nc: 4
+names:
+- ball
+- goalkeeper
+- player
+- referee

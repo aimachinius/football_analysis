@@ -1,0 +1,95 @@
+# ============================================================
+# Football CV Analysis — .gitignore
+# ============================================================
+
+# === Python Cache ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.pdb
+
+# === Virtual Environments ===
+.venv/
+venv/
+env/
+.env
+
+# === Model Weights (large binary — manage separately via DVC/LFS) ===
+*.pt
+*.pth
+*.onnx
+*.weights
+*.safetensors
+
+# === Stubs / Detection Cache ===
+stubs/
+
+# === Dataset & Raw Data ===
+data/
+NewData/
+
+# === Input Videos ===
+video/
+
+# === Output Videos (keep only milestone outputs) ===
+output/*
+!output/gd4.mp4
+!output/gd4_minimap.mp4
+!output/benchmark_run_optimized.mp4
+!output/benchmark_run_optimized_minimap.mp4
+
+# === Reports — KEEP (do NOT ignore) ===
+# reports/ is tracked intentionally
+
+# === Agent workspace (internal use only) ===
+.agents/
+
+# === Test & Benchmark Scripts ===
+test_*.py
+test.py
+benchmark_*.py
+run_benchmark_*.py
+verify_central_view_real_frame.py
+evaluate_video_stage3.py
+
+# === One-off / Utility Scripts (not part of pipeline) ===
+high_frame.py
+extract_frame.py
+checkupdate.py
+
+# === Misc Junk ===
+list_comand.txt
+cookies.txt
+*.tmp
+*.log
+*.bak
+
+# === Notebook / Analysis Exploratory Dirs ===
+analysis/
+detect/
+
+# === Build & Packaging Artifacts ===
+*.egg-info/
+dist/
+build/
+*.spec
+
+# === IDE / Editor ===
+.idea/
+.vscode/
+*.suo
+*.user
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+
+# === Testing Infrastructure ===
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+coverage.xml
+
