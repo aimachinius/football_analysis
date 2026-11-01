@@ -25,12 +25,17 @@ class Tracker:
         batch_size=8,
         det_conf=None,  # Hỗ trợ tương thích ngược
         device=None,
+        reid_min_conf=None,
+        draw_interpolated_ball=False,
     ):
         import torch
         if device is None:
             self.device = 0 if torch.cuda.is_available() else "cpu"
         else:
             self.device = device
+
+        self.reid_min_conf = reid_min_conf
+        self.draw_interpolated_ball = draw_interpolated_ball
 
         self.model = YOLO(model_path)   
         self.tracker = ByteTrackTracker(
@@ -83,9 +88,10 @@ class Tracker:
         self.track_role_history = defaultdict(list)
 
         # Ngưỡng thấp nhất để YOLO predict không bỏ sót class nào
-        self.min_predict_conf = max(
-            0.10, min(self.player_conf, self.goalkeeper_conf, self.referee_conf, self.ball_conf) - 0.05
-        )
+        min_confs = [self.player_conf, self.goalkeeper_conf, self.referee_conf, self.ball_conf]
+        if self.reid_min_conf is not None:
+            min_confs.append(self.reid_min_conf)
+        self.min_predict_conf = max(0.10, min(min_confs) - 0.05)
 
     def _suppress_cross_class_overlaps(self, det, ids, iou_thresh=0.45):
         """
@@ -287,10 +293,19 @@ class Tracker:
                 tracked = tracked[tracked.tracker_id != -1]
             else:
                 # choose_Al == 2: Algorithmic Re-ID Tracker (P0)
+                if self.reid_min_conf is not None:
+                    p_conf = self.reid_min_conf
+                    gk_conf = min(self.reid_min_conf, self.goalkeeper_conf)
+                    ref_conf = min(self.reid_min_conf, self.referee_conf)
+                else:
+                    p_conf = self.player_conf
+                    gk_conf = self.goalkeeper_conf
+                    ref_conf = self.referee_conf
+
                 is_person = (
-                    ((det.class_id == ids["player"]) & (det.confidence >= self.player_conf)) |
-                    ((det.class_id == ids["goalkeeper"]) & (det.confidence >= self.goalkeeper_conf)) |
-                    ((det.class_id == ids["referee"]) & (det.confidence >= self.referee_conf))
+                    ((det.class_id == ids["player"]) & (det.confidence >= p_conf)) |
+                    ((det.class_id == ids["goalkeeper"]) & (det.confidence >= gk_conf)) |
+                    ((det.class_id == ids["referee"]) & (det.confidence >= ref_conf))
                 )
                 person_det = det[is_person]
                 tracked = self.reid_tracker.update(person_det, frame=frame, camera_homography=G_t)
@@ -365,10 +380,18 @@ class Tracker:
                 if not outfield_players:
                     outfield_players = players
 
+                # Bảo vệ K-Means: Chỉ dùng cầu thủ có detection tin cậy (conf >= player_conf) để fit màu áo
+                fit_players = {
+                    pid: p for pid, p in outfield_players.items()
+                    if p.get("confidence", 1.0) >= self.player_conf
+                }
+                if not fit_players:
+                    fit_players = outfield_players
+
                 if 1 not in team_assigner.team_colors or 2 not in team_assigner.team_colors:
-                    buffered_early_frames.append((frame_index, frame, outfield_players))
-                    if frame_index == 3 or (frame_index >= 3 and len(outfield_players) >= 2):
-                        team_assigner.assign_team_color(frame, outfield_players)
+                    buffered_early_frames.append((frame_index, frame, fit_players))
+                    if frame_index == 3 or (frame_index >= 3 and len(fit_players) >= 2):
+                        team_assigner.assign_team_color(frame, fit_players)
                         if 1 in team_assigner.team_colors and 2 in team_assigner.team_colors:
                             for b_idx, b_frame, b_players in buffered_early_frames:
                                 for p_id, p_track in b_players.items():
@@ -378,7 +401,11 @@ class Tracker:
                             buffered_early_frames.clear()
                 else:
                     for p_id, p_track in outfield_players.items():
-                        team = team_assigner.get_player_team(frame, p_track['bbox'], p_id)
+                        # Chỉ bỏ phiếu màu áo nếu detection đủ tin cậy, tránh nhiễu do che khuất
+                        if p_track.get("confidence", 1.0) >= self.player_conf:
+                            team = team_assigner.get_player_team(frame, p_track['bbox'], p_id)
+                        else:
+                            team = team_assigner.player_team_dict.get(p_id, 1)
                         tracks["players"][frame_index][p_id]['team'] = team
                         tracks["players"][frame_index][p_id]['team_color'] = team_assigner.team_colors[team]
 

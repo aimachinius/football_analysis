@@ -130,6 +130,7 @@ def main(
     calib_path="calib/points.json",
     generate_minimap=True,
     device=None,
+    reid_min_conf=None,
 ):
     # Xác định tên và đường dẫn lưu video
     if not output_name:
@@ -178,6 +179,7 @@ def main(
         ball_conf=ball_conf,
         batch_size=batch_size,
         device=target_device,
+        reid_min_conf=reid_min_conf,
     )
     camera_motion = CameraMotion()
     team_assigner = TeamAssigner()
@@ -370,6 +372,12 @@ if __name__ == "__main__":
         default=None,
         help="Thiết bị xử lý (ví dụ: 0, 'cpu'; mặc định tự động chọn CUDA nếu có)",
     )
+    parser.add_argument(
+        "--reid-min-conf",
+        type=float,
+        default=None,
+        help="Ngưỡng lọc confidence riêng trước ReIDTrackerFacade.update (mặc định: None = dùng player_conf/gk_conf/ref_conf)",
+    )
     args = parser.parse_args()
 
     main(
@@ -384,4 +392,6 @@ if __name__ == "__main__":
         calib_path=args.calib,
         generate_minimap=not args.no_minimap,
         device=args.device,
+        reid_min_conf=args.reid_min_conf,
+    )
     )
