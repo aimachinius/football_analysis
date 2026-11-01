@@ -1,27 +1,16 @@
 """
 scripts/measure_baseline.py - Script do va kiem chung baseline cho du an CV_Football_Analys.
 
-KHONG thay doi hanh vi thuat toan. Chay pipeline nguyen ban va thu thap cac chi so thuc te:
-  1. Chi so nguoi (Player & Referee Tracking):
-     - So ID duy nhat, so tracklet, do dai track trung binh/median.
-     - So doan dut / phan manh.
-     - So lan doi class cua cung 1 track qua cac frame.
-     - So detection conf trong [0.15, 0.35) bi loai truoc Re-ID.
-     - So ID moi sinh sau khi co tracklet bi LOST.
-  2. Chi so qua bong (Ball Detection, Gating & Stabilizer):
-     - So frame co detection tho tu YOLO.
-     - So frame sau _select_ball_detection.
-     - So frame sau BallTrajectoryStabilizer (DETECTED / INTERPOLATED / LOST).
-     - Gap mat dau dai nhat.
-     - So lan ung vien bi gating loai bo.
-     - So lan doi nguoi giu bong (turnovers) / phut.
-  3. Chi so he thong (Performance & Resources):
-     - Thoi gian chay tung giai doan (Pass 1, Ball stabilizer, Pitch mapping, Downstream).
-     - RAM peak RSS (MB), CUDA peak VRAM (MB).
-
-Xuat file:
-  reports/baseline_metrics.json
-  In bang ket qua truc quan ra console.
+Ho tro:
+  - Do 1 cau hinh don le hoac do toan bo cac cau hinh (--compare-all):
+    + Nguoi: baseline (reid_min_conf=None), reid_min_conf=0.20, reid_min_conf=0.15.
+    + Possession: Hysteresis N = 0, 3, 5, 8.
+  - Thu thap cac chi so bo sung:
+    + Proxy ID switch (mot ID LOST roi sinh ID moi trong <=30f gan vi tri cu).
+    + So track "ma" (<10 frame ma toan bo detection conf < 0.40).
+    + So lan doi chu bong theo ID VA theo doi, do dai trung binh mot luot giu bong.
+    + Dem chinh xac so detection dai [0.15, 0.20) vs [0.20, 0.35) va ghi ro Stage 2 bo qua.
+  - Xuat contact sheet (moi 5 frame) cho cac doan 165-185, 300-350, 510-545.
 """
 
 import os
@@ -42,7 +31,6 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 from utils import read_video
 from tracker import Tracker
-from tracker.ball_tracker import BallTrajectoryStabilizer
 from camera_motion import CameraMotion
 from team_assignment import TeamAssigner
 from player_ball_assigner import PlayerBallAssigner
@@ -94,71 +82,300 @@ class ResourceMonitor:
             self.thread.join(timeout=1.0)
 
 
-def measure_baseline(
+def compute_possession_stats(tracks_players, tracks_ball, hysteresis=0, fps=25.0):
+    """
+    Tinh toan chi so kiem soat bong voi nguong hysteresis N.
+    - Doi chu theo ID
+    - Doi chu theo Doi
+    - Do dai trung binh 1 luot giu bong (theo ID va theo Doi)
+    """
+    assigner = PlayerBallAssigner(hysteresis=hysteresis)
+    team_control = []
+    player_control = []
+    id_turnovers = 0
+    team_turnovers = 0
+    last_player = -1
+    last_team = 0
+
+    player_possession_durations = []
+    team_possession_durations = []
+
+    curr_p_len = 0
+    curr_t_len = 0
+
+    for f_idx, player_track in enumerate(tracks_players):
+        ball_bbox = tracks_ball[f_idx][1]["bbox"] if 1 in tracks_ball[f_idx] else None
+        p_id = assigner.assign_ball_to_player(player_track, ball_bbox)
+        player_control.append(p_id)
+
+        if p_id != -1 and p_id in player_track:
+            team_id = player_track[p_id].get("team", 0)
+        else:
+            team_id = team_control[-1] if team_control else 0
+        team_control.append(team_id)
+
+        # ID changes
+        if p_id != -1:
+            if last_player != -1 and p_id != last_player:
+                id_turnovers += 1
+                if curr_p_len > 0:
+                    player_possession_durations.append(curr_p_len)
+                curr_p_len = 1
+            else:
+                curr_p_len += 1
+            last_player = p_id
+        else:
+            if curr_p_len > 0:
+                player_possession_durations.append(curr_p_len)
+                curr_p_len = 0
+
+        # Team changes
+        if team_id in (1, 2):
+            if last_team in (1, 2) and team_id != last_team:
+                team_turnovers += 1
+                if curr_t_len > 0:
+                    team_possession_durations.append(curr_t_len)
+                curr_t_len = 1
+            else:
+                curr_t_len += 1
+            last_team = team_id
+
+    if curr_p_len > 0:
+        player_possession_durations.append(curr_p_len)
+    if curr_t_len > 0:
+        team_possession_durations.append(curr_t_len)
+
+    total_time_min = len(tracks_players) / fps / 60.0
+    mean_p_dur = float(np.mean(player_possession_durations)) if player_possession_durations else 0.0
+    mean_t_dur = float(np.mean(team_possession_durations)) if team_possession_durations else 0.0
+
+    return {
+        "hysteresis": hysteresis,
+        "id_turnovers": id_turnovers,
+        "id_turnovers_per_min": round(id_turnovers / max(0.01, total_time_min), 2),
+        "team_turnovers": team_turnovers,
+        "team_turnovers_per_min": round(team_turnovers / max(0.01, total_time_min), 2),
+        "mean_player_possession_frames": round(mean_p_dur, 2),
+        "mean_player_possession_sec": round(mean_p_dur / fps, 2),
+        "mean_team_possession_frames": round(mean_t_dur, 2),
+        "mean_team_possession_sec": round(mean_t_dur / fps, 2),
+        "team_ball_control": team_control,
+        "player_control": player_control,
+    }
+
+
+def compute_proxy_id_switches(tracks_players, fps=25.0, max_gap_frames=30, max_dist_px=200.0, max_dist_m=6.0):
+    """
+    Dem so lan proxy ID switch: mot ID LOST roi sinh ID moi trong <=30f gan vi tri cu.
+    Kiem tra tren ca toa do pixel va toa do met tren san (neu co).
+    """
+    track_info = {}
+    for f_idx, frame_players in enumerate(tracks_players):
+        for pid, p in frame_players.items():
+            bbox = p["bbox"]
+            foot_px = ((bbox[0] + bbox[2]) / 2.0, bbox[3])
+            pos_m = p.get("position_transformed")
+            team = p.get("team", 0)
+            conf = p.get("confidence", 1.0)
+
+            if pid not in track_info:
+                track_info[pid] = {
+                    "start_frame": f_idx,
+                    "end_frame": f_idx,
+                    "start_foot_px": foot_px,
+                    "end_foot_px": foot_px,
+                    "start_pos_m": pos_m,
+                    "end_pos_m": pos_m,
+                    "team": team,
+                    "confs": [conf],
+                    "count": 1,
+                }
+            else:
+                track_info[pid]["end_frame"] = f_idx
+                track_info[pid]["end_foot_px"] = foot_px
+                if pos_m is not None:
+                    track_info[pid]["end_pos_m"] = pos_m
+                if track_info[pid]["start_pos_m"] is None and pos_m is not None:
+                    track_info[pid]["start_pos_m"] = pos_m
+                track_info[pid]["confs"].append(conf)
+                track_info[pid]["count"] += 1
+
+    total_frames = len(tracks_players)
+    switches = []
+    # Kiem tra cac track bi LOST truoc cuoi video
+    for id_a, info_a in track_info.items():
+        if info_a["end_frame"] >= total_frames - 5:
+            continue  # Con song den cuoi video
+        candidates = []
+        for id_b, info_b in track_info.items():
+            if id_b == id_a:
+                continue
+            dt = info_b["start_frame"] - info_a["end_frame"]
+            if 0 <= dt <= max_gap_frames:
+                # Kiem tra khoang cach met neu co, hoac pixel
+                matched = False
+                dist_val = 0.0
+                if info_a["end_pos_m"] is not None and info_b["start_pos_m"] is not None:
+                    dm = np.hypot(
+                        info_b["start_pos_m"][0] - info_a["end_pos_m"][0],
+                        info_b["start_pos_m"][1] - info_a["end_pos_m"][1]
+                    )
+                    if dm <= max_dist_m:
+                        matched = True
+                        dist_val = dm
+                else:
+                    dpx = np.hypot(
+                        info_b["start_foot_px"][0] - info_a["end_foot_px"][0],
+                        info_b["start_foot_px"][1] - info_a["end_foot_px"][1]
+                    )
+                    if dpx <= max_dist_px:
+                        matched = True
+                        dist_val = dpx
+
+                if matched:
+                    candidates.append((dist_val, dt, id_b))
+
+        if candidates:
+            candidates.sort()
+            best_dist, best_dt, best_id_b = candidates[0]
+            switches.append({
+                "lost_id": id_a,
+                "new_id": best_id_b,
+                "lost_frame": info_a["end_frame"],
+                "new_frame": track_info[best_id_b]["start_frame"],
+                "frame_gap": best_dt,
+                "distance": round(best_dist, 2),
+            })
+
+    # Track "ma": <10 frame ma toan bo detection conf < 0.40
+    ghost_tracks = [
+        pid for pid, inf in track_info.items()
+        if inf["count"] < 10 and all(c < 0.40 for c in inf["confs"])
+    ]
+
+    return len(switches), switches, len(ghost_tracks), ghost_tracks, track_info
+
+
+def generate_contact_sheets(video_path, tracks_dict, output_dir="reports/contact_sheets", step=5):
+    """
+    Xuat contact sheet (moi 5 frame) cho cac doan 165-185, 300-350, 510-545.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    ranges = {
+        "165_185": (165, 185),
+        "300_350": (300, 350),
+        "510_545": (510, 545),
+    }
+
+    cap = cv2.VideoCapture(video_path)
+    thumb_w, thumb_h = 480, 270
+
+    generated_paths = []
+    for r_name, (f_start, f_end) in ranges.items():
+        frame_list = list(range(f_start, f_end + 1, step))
+        thumbnails = []
+
+        for f_idx in frame_list:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, f_idx)
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+
+            vis = frame.copy()
+            # Draw players
+            if f_idx < len(tracks_dict.get("players", [])):
+                for pid, p in tracks_dict["players"][f_idx].items():
+                    bbox = [int(v) for v in p["bbox"]]
+                    color = p.get("team_color", (0, 0, 255))
+                    cv2.rectangle(vis, (bbox[0], bbox[1]), (bbox[2], bbox[3]), color, 2)
+                    conf = p.get("confidence", 1.0)
+                    cv2.putText(vis, f"P{pid} {conf:.2f}", (bbox[0], max(18, bbox[1] - 6)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+            # Draw ball
+            if f_idx < len(tracks_dict.get("ball", [])):
+                if 1 in tracks_dict["ball"][f_idx]:
+                    b = tracks_dict["ball"][f_idx][1]
+                    bbox = [int(v) for v in b["bbox"]]
+                    is_interp = b.get("is_interpolated", False)
+                    cx = (bbox[0] + bbox[2]) // 2
+                    cy = (bbox[1] + bbox[3]) // 2
+                    if is_interp:
+                        cv2.circle(vis, (cx, cy), 10, (0, 215, 255), 2, cv2.LINE_AA)
+                        cv2.putText(vis, "BALL(interp)", (bbox[0] - 20, bbox[1] - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 215, 255), 2)
+                    else:
+                        cv2.circle(vis, (cx, cy), 8, (255, 0, 0), -1, cv2.LINE_AA)
+                        cv2.putText(vis, "BALL", (bbox[0] - 10, bbox[1] - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 0), 2)
+
+            # Header box
+            cv2.rectangle(vis, (0, 0), (280, 42), (0, 0, 0), -1)
+            cv2.putText(vis, f"Frame {f_idx}", (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+
+            th = cv2.resize(vis, (thumb_w, thumb_h))
+            thumbnails.append(th)
+
+        if thumbnails:
+            n = len(thumbnails)
+            cols = min(4, n)
+            rows = (n + cols - 1) // cols
+            grid = np.zeros((rows * thumb_h, cols * thumb_w, 3), dtype=np.uint8)
+            for i, th in enumerate(thumbnails):
+                r = i // cols
+                c = i % cols
+                grid[r * thumb_h:(r + 1) * thumb_h, c * thumb_w:(c + 1) * thumb_w] = th
+
+            out_file = os.path.join(output_dir, f"contact_sheet_{r_name}.jpg")
+            cv2.imwrite(out_file, grid)
+            print(f"-> Da xuat contact sheet: {out_file} ({n} thumbnails)")
+            generated_paths.append(out_file)
+
+    cap.release()
+    return generated_paths
+
+
+def measure_single_config(
     video_path="video/sample.mp4",
     model_path=None,
     calib_path="calib/points.json",
     batch_size=8,
-    output_json="reports/baseline_metrics.json",
+    reid_min_conf=None,
+    draw_interpolated_ball=False,
+    possession_hysteresis=0,
+    stub_path=None,
+    load_stub=False,
 ):
-    print("=" * 80)
-    print("BAT DAU DO BASELINE HE THONG: CV_FOOTBALL_ANALYS")
-    print(f"Video input: {video_path}")
-    print(f"Calib path:  {calib_path}")
-    print("=" * 80)
-
-    if not os.path.exists(video_path):
-        raise FileNotFoundError(f"Video not found: {video_path}")
-
+    """
+    Chay pipeline cho mot cau hinh nhat dinh va thu thap so lieu day du.
+    """
     if model_path is None:
         model_path = "best_V26_over_6000.pt" if os.path.exists("best_V26_over_6000.pt") else "best_YOLOv26s_FB_OD.pt"
-    print(f"Model path:  {model_path}")
 
-    # Start resource monitor
-    monitor = ResourceMonitor(interval=0.05)
-    monitor.start()
-
-    # Read video properties
     cap = cv2.VideoCapture(video_path)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     cap.release()
-    duration_sec = total_frames / fps
-    duration_min = duration_sec / 60.0
-    print(f"Video properties: {w}x{h}, {total_frames} frames, {fps:.1f} fps, {duration_sec:.2f}s ({duration_min:.2f} min)")
 
-    # Data collectors
-    metrics = {
-        "video": {
-            "path": video_path,
-            "total_frames": total_frames,
-            "fps": fps,
-            "duration_sec": duration_sec,
-            "duration_min": duration_min,
-            "resolution": f"{w}x{h}",
-        },
-        "person_tracking": {},
-        "ball_tracking": {},
-        "system_performance": {},
-    }
-
-    # Tracking instrumentation counters
+    # Track instrumentation counters
     raw_person_detections_total = 0
     dropped_person_015_035_count = 0
+    dropped_person_015_020_count = 0
+    dropped_person_020_035_count = 0
     dropped_person_by_class = defaultdict(int)
+
     raw_ball_detections_total = 0
     frames_with_raw_ball = set()
     ball_gating_rejections_count = 0
     ball_in_gate_selections_count = 0
     ball_out_gate_accepted_count = 0
 
-    # Tracklet state transitions monitor
-    lost_events = []  # (frame, track_id)
-    new_track_allocations = []  # (frame, track_id)
+    new_track_allocations = []
 
-    # Initialize tracker
+    # Monitor resources
+    monitor = ResourceMonitor(interval=0.05)
+    monitor.start()
+
     target_device = 0 if torch.cuda.is_available() else "cpu"
     tracker = Tracker(
         model_path=model_path,
@@ -169,11 +386,12 @@ def measure_baseline(
         ball_conf=0.20,
         batch_size=batch_size,
         device=target_device,
+        reid_min_conf=reid_min_conf,
+        draw_interpolated_ball=draw_interpolated_ball,
     )
     camera_motion = CameraMotion()
     team_assigner = TeamAssigner()
 
-    # Pre-load anchor if calib exists (same as main.py)
     if os.path.exists(calib_path):
         pts_init = load_points(calib_path)
         if pts_init:
@@ -184,7 +402,7 @@ def measure_baseline(
                 cap_temp = cv2.VideoCapture(video_path)
                 f_idx = 0
                 target_frame = None
-                while f_idx <= first_frame_idx:
+                while cap_temp.isOpened():
                     ret_tmp, f_tmp = cap_temp.read()
                     if not ret_tmp:
                         break
@@ -196,15 +414,13 @@ def measure_baseline(
                     gray_init = cv2.cvtColor(target_frame, cv2.COLOR_BGR2GRAY) if len(target_frame.shape) == 3 else target_frame
                     camera_motion.add_global_anchor(first_frame_idx, gray_init, H_init, seg=0)
 
-    # Wrap _select_ball_detection non-invasively to observe gating rejections
+    # Monitored ball selection
     orig_select_ball = tracker._select_ball_detection
 
     def monitored_select_ball(ball_det, frame_index, frame_shape, state):
         nonlocal ball_gating_rejections_count, ball_in_gate_selections_count, ball_out_gate_accepted_count
         h_f, w_f = frame_shape[:2]
         diag = float(np.hypot(w_f, h_f))
-        
-        # Check if there are candidate boxes
         if len(ball_det) > 0:
             c_confs = np.asarray(ball_det.confidence, dtype=float)
             c_keep = c_confs >= max(0.10, tracker.ball_conf - 0.05)
@@ -230,19 +446,18 @@ def measure_baseline(
                             ball_gating_rejections_count += 1
                         else:
                             ball_out_gate_accepted_count += 1
-
         return orig_select_ball(ball_det, frame_index, frame_shape, state)
 
     tracker._select_ball_detection = monitored_select_ball
 
-    # Wrap detect_frame generator to observe raw person & ball detections
+    # Monitored detect_frame
     orig_detect_frame = tracker.detect_frame
 
     def monitored_detect_frame(list_frame):
-        nonlocal raw_person_detections_total, dropped_person_015_035_count, raw_ball_detections_total
+        nonlocal raw_person_detections_total, dropped_person_015_035_count
+        nonlocal dropped_person_015_020_count, dropped_person_020_035_count, raw_ball_detections_total
         for f_idx, d_frame in enumerate(orig_detect_frame(list_frame)):
             names_map = {v: k for k, v in d_frame.names.items()}
-            # Count raw ball
             b_cls = names_map.get("ball", 0)
             p_cls = names_map.get("player", 2)
             gk_cls = names_map.get("goalkeeper", 1)
@@ -259,65 +474,78 @@ def measure_baseline(
                         frames_with_raw_ball.add(f_idx)
                     elif c_id in (p_cls, gk_cls, ref_cls):
                         raw_person_detections_total += 1
-                        # Check threshold condition
-                        if c_id == p_cls:
-                            thresh = tracker.player_conf
-                            c_name = "player"
-                        elif c_id == gk_cls:
-                            thresh = tracker.goalkeeper_conf
-                            c_name = "goalkeeper"
+                        # Determine threshold applied before Re-ID
+                        if reid_min_conf is not None:
+                            p_thresh = reid_min_conf
+                            gk_thresh = min(reid_min_conf, tracker.goalkeeper_conf)
+                            ref_thresh = min(reid_min_conf, tracker.referee_conf)
                         else:
-                            thresh = tracker.referee_conf
-                            c_name = "referee"
+                            p_thresh = tracker.player_conf
+                            gk_thresh = tracker.goalkeeper_conf
+                            ref_thresh = tracker.referee_conf
+
+                        thresh = p_thresh if c_id == p_cls else (gk_thresh if c_id == gk_cls else ref_thresh)
+                        c_name = "player" if c_id == p_cls else ("goalkeeper" if c_id == gk_cls else "referee")
 
                         if conf < thresh:
                             if conf >= 0.15:
                                 dropped_person_015_035_count += 1
                                 dropped_person_by_class[c_name] += 1
+                                if conf < 0.20:
+                                    dropped_person_015_020_count += 1
+                                else:
+                                    dropped_person_020_035_count += 1
 
             yield d_frame
 
     tracker.detect_frame = monitored_detect_frame
 
-    # Wrap TrackManager._allocate_id to observe new tracklet allocations
+    # Monitored allocate_id
     orig_allocate_id = tracker.reid_tracker.manager._allocate_id
 
     def monitored_allocate_id():
-        new_id = orig_allocate_id()
-        cur_f = tracker.reid_tracker.manager.frame_count
-        new_track_allocations.append((cur_f, new_id))
-        return new_id
+        tid = orig_allocate_id()
+        f_cnt = tracker.reid_tracker.manager.frame_count
+        new_track_allocations.append((f_cnt, tid))
+        return tid
 
     tracker.reid_tracker.manager._allocate_id = monitored_allocate_id
 
-    # Timing Pass 1
+    # Run or load stub
+    video_frames, _ = read_video(video_path)
     t0_pass1 = time.perf_counter()
-    frames_generator, _ = read_video(video_path)
-    
-    print("\n--- CHAY PASS 1 (TRACKING + CAMERA MOTION + TEAM ASSIGNMENT) ---")
-    tracks, motion = tracker.process_pass1(
-        frames_generator,
-        camera_motion=camera_motion,
-        team_assigner=team_assigner,
-        read_from_stub=False,
-        choose_Al=2,
-    )
+
+    if load_stub and stub_path and os.path.exists(stub_path):
+        print(f"Loading Pass 1 tracks from stub: {stub_path}")
+        with open(stub_path, "rb") as f:
+            tracks = pickle.load(f)
+        motion = CameraMotion()  # dummy
+    else:
+        tracks, motion = tracker.process_pass1(
+            video_frames,
+            camera_motion=camera_motion,
+            team_assigner=team_assigner,
+            read_from_stub=False,
+            choose_Al=2,
+        )
+        if stub_path:
+            os.makedirs(os.path.dirname(stub_path) or ".", exist_ok=True)
+            with open(stub_path, "wb") as f:
+                pickle.dump(tracks, f)
+
     t_pass1 = time.perf_counter() - t0_pass1
     fps_pass1 = total_frames / max(0.001, t_pass1)
-    print(f"-> Pass 1 hoan tat trong {t_pass1:.2f}s ({fps_pass1:.2f} FPS).")
 
-    # Timing Ball Stabilization
+    # Ball stabilization
     t0_ball = time.perf_counter()
-    print("\n--- CHAY ON DINH BONG (BallTrajectoryStabilizer) ---")
     stabilized_ball = tracker.interpolate_ball_position(
         tracks["ball"],
         camera_motion=motion,
         player_tracks=tracks.get("players"),
     )
     t_ball = time.perf_counter() - t0_ball
-    print(f"-> BallTrajectoryStabilizer hoan tat trong {t_ball*1000:.2f} ms.")
 
-    # Timing Pitch Calibration & Mapping
+    # Pitch mapping
     t0_pitch = time.perf_counter()
     tracker.add_position_to_track(tracks)
     calib = PitchCalibration.fit(load_points(calib_path), motion)
@@ -325,56 +553,22 @@ def measure_baseline(
     mapper.add_positions_to_tracks(tracks)
     t_pitch = time.perf_counter() - t0_pitch
 
-    # Timing Speed & Distance
+    # Speed & Distance
     t0_speed = time.perf_counter()
     s_d_calculate = SpeedAndDistance_Calc(fps)
     s_d_calculate.add_speed_and_distance_to_tracks(tracks)
     t_speed = time.perf_counter() - t0_speed
 
-    # Timing Player-Ball Assigner & Possession
-    t0_assign = time.perf_counter()
-    player_assigner = PlayerBallAssigner()
-    team_ball_control = []
-    possession_changes = 0
-    last_possessor = -1
-    possessor_timeline = []
-
-    for f_idx, player_track in enumerate(tracks["players"]):
-        assigned_player = -1
-        if 1 in tracks["ball"][f_idx]:
-            ball_bbox = tracks["ball"][f_idx][1]["bbox"]
-            assigned_player = player_assigner.assign_ball_to_player(player_track, ball_bbox)
-
-        possessor_timeline.append(assigned_player)
-        if assigned_player != -1:
-            player_track[assigned_player]["has_ball"] = True
-            team_ball_control.append(player_track[assigned_player].get("team", 0))
-            if last_possessor != -1 and assigned_player != last_possessor:
-                possession_changes += 1
-            last_possessor = assigned_player
-        else:
-            team_ball_control.append(team_ball_control[-1] if len(team_ball_control) > 0 else 0)
-
-    t_assign = time.perf_counter() - t0_assign
-
-    # Stop resource monitor
     monitor.stop()
 
-    # =========================================================================
-    # CALCULATE METRICS - PERSON TRACKING
-    # =========================================================================
+    # Calculate person tracking metrics
     players_data = tracks["players"]
     referees_data = tracks["referees"]
 
-    # Collect track timelines
-    # id -> list of frame indices where it appeared
     player_appearances = defaultdict(list)
-    player_classes = defaultdict(list)
     for f_idx, frame_players in enumerate(players_data):
         for pid, pinfo in frame_players.items():
             player_appearances[pid].append(f_idx)
-            is_gk = pinfo.get("is_goalkeeper", False)
-            player_classes[pid].append("goalkeeper" if is_gk else "player")
 
     ref_appearances = defaultdict(list)
     for f_idx, frame_refs in enumerate(referees_data):
@@ -384,21 +578,16 @@ def measure_baseline(
     all_player_ids = set(player_appearances.keys())
     all_ref_ids = set(ref_appearances.keys())
     all_person_ids = all_player_ids | all_ref_ids
-    cross_class_ids = all_player_ids & all_ref_ids
 
-    # Track durations
     all_durations = [len(app) for app in player_appearances.values()]
     all_durations.extend([len(app) for app in ref_appearances.values()])
     mean_dur = float(np.mean(all_durations)) if all_durations else 0.0
     median_dur = float(np.median(all_durations)) if all_durations else 0.0
-
     short_tracks = sum(1 for d in all_durations if d < 30)
-    med_tracks = sum(1 for d in all_durations if 30 <= d <= 150)
-    long_tracks = sum(1 for d in all_durations if d > 150)
 
-    # Fragmentation / Gaps within active tracks
-    fragmented_tracks_count = 0
+    # Gaps within active tracks
     total_gaps_count = 0
+    fragmented_tracks_count = 0
     for pid, app in player_appearances.items():
         if len(app) >= 2:
             diffs = np.diff(app)
@@ -407,68 +596,33 @@ def measure_baseline(
                 fragmented_tracks_count += 1
                 total_gaps_count += int(gaps)
 
-    # Class flips within tracklet
-    class_flip_count = 0
-    class_flip_ids = []
-    for pid, classes in player_classes.items():
-        flips = sum(1 for i in range(1, len(classes)) if classes[i] != classes[i-1])
-        if flips > 0:
-            class_flip_count += flips
-            class_flip_ids.append((pid, flips))
+    # Proxy ID switches and ghost tracks
+    n_proxy_switches, proxy_details, n_ghost_tracks, ghost_pids, track_info = compute_proxy_id_switches(
+        players_data, fps=fps
+    )
 
-    # New IDs allocated after a tracklet becomes lost
-    # Check new allocations that occurred within [t, t+5] frames
-    total_allocated_ids = len(new_track_allocations)
+    # Multi-hysteresis possession stats
+    possession_res = compute_possession_stats(
+        players_data, tracks["ball"], hysteresis=possession_hysteresis, fps=fps
+    )
 
-    metrics["person_tracking"] = {
-        "unique_player_ids": len(all_player_ids),
-        "unique_referee_ids": len(all_ref_ids),
-        "total_unique_person_ids": len(all_person_ids),
-        "total_tracklets_allocated": total_allocated_ids,
-        "mean_track_duration_frames": round(mean_dur, 2),
-        "mean_track_duration_sec": round(mean_dur / fps, 2),
-        "median_track_duration_frames": round(median_dur, 2),
-        "median_track_duration_sec": round(median_dur / fps, 2),
-        "short_tracks_less_30f": short_tracks,
-        "medium_tracks_30_150f": med_tracks,
-        "long_tracks_over_150f": long_tracks,
-        "fragmented_tracks_count": fragmented_tracks_count,
-        "total_internal_gaps": total_gaps_count,
-        "class_flip_events_within_tracks": class_flip_count,
-        "class_flip_track_ids": class_flip_ids,
-        "cross_class_id_collisions": len(cross_class_ids),
-        "raw_person_detections": raw_person_detections_total,
-        "dropped_person_conf_015_035": dropped_person_015_035_count,
-        "dropped_person_by_class": dict(dropped_person_by_class),
-    }
-
-    # =========================================================================
-    # CALCULATE METRICS - BALL TRACKING
-    # =========================================================================
-    # Before stabilizer: tracks['ball'] (output from _select_ball_detection)
-    ball_before_stab = tracks["ball"]
-    frames_selected_ball = sum(1 for f in ball_before_stab if 1 in f)
-
-    # After stabilizer: stabilized_ball
-    stab_detected_frames = 0
-    stab_interp_frames = 0
-    stab_lost_frames = 0
-
+    # Ball stats
+    stab_detected = 0
+    stab_interp = 0
+    stab_lost = 0
     ball_presence = []
     for f in stabilized_ball:
         if 1 in f:
-            b_info = f[1]
-            if b_info.get("is_interpolated", False):
-                stab_interp_frames += 1
+            if f[1].get("is_interpolated", False):
+                stab_interp += 1
                 ball_presence.append("INTERPOLATED")
             else:
-                stab_detected_frames += 1
+                stab_detected += 1
                 ball_presence.append("DETECTED")
         else:
-            stab_lost_frames += 1
+            stab_lost += 1
             ball_presence.append("LOST")
 
-    # Longest gap
     max_gap = 0
     cur_gap = 0
     for p in ball_presence:
@@ -479,96 +633,130 @@ def measure_baseline(
         else:
             cur_gap = 0
 
-    turnovers_per_min = possession_changes / max(0.01, duration_min)
-
-    metrics["ball_tracking"] = {
-        "raw_ball_detections_total": raw_ball_detections_total,
-        "frames_with_raw_ball": len(frames_with_raw_ball),
-        "frames_with_raw_ball_pct": round(len(frames_with_raw_ball) / total_frames * 100, 2),
-        "frames_after_select_ball": frames_selected_ball,
-        "frames_after_select_ball_pct": round(frames_selected_ball / total_frames * 100, 2),
-        "ball_gating_rejections": ball_gating_rejections_count,
-        "ball_in_gate_selections": ball_in_gate_selections_count,
-        "ball_out_gate_accepted": ball_out_gate_accepted_count,
-        "stabilizer_detected_frames": stab_detected_frames,
-        "stabilizer_interpolated_frames": stab_interp_frames,
-        "stabilizer_lost_frames": stab_lost_frames,
-        "stabilizer_valid_ball_frames": stab_detected_frames + stab_interp_frames,
-        "stabilizer_valid_ball_pct": round((stab_detected_frames + stab_interp_frames) / total_frames * 100, 2),
-        "longest_ball_dropout_gap_frames": max_gap,
-        "longest_ball_dropout_gap_sec": round(max_gap / fps, 2),
-        "possession_changes_turnovers": possession_changes,
-        "possession_turnovers_per_min": round(turnovers_per_min, 2),
+    return {
+        "config": {
+            "reid_min_conf": reid_min_conf,
+            "draw_interpolated_ball": draw_interpolated_ball,
+            "possession_hysteresis": possession_hysteresis,
+        },
+        "person_tracking": {
+            "unique_player_ids": len(all_player_ids),
+            "unique_referee_ids": len(all_ref_ids),
+            "total_unique_person_ids": len(all_person_ids),
+            "total_tracklets_allocated": len(new_track_allocations) if new_track_allocations else len(track_info),
+            "mean_track_duration_frames": round(mean_dur, 2),
+            "median_track_duration_frames": round(median_dur, 2),
+            "short_tracks_less_30f": short_tracks,
+            "total_internal_gaps": total_gaps_count,
+            "fragmented_tracks_count": fragmented_tracks_count,
+            "proxy_id_switches": n_proxy_switches,
+            "proxy_switch_details": proxy_details[:5],
+            "ghost_tracks_count": n_ghost_tracks,
+            "ghost_track_ids": ghost_pids,
+            "dropped_person_015_035": dropped_person_015_035_count,
+            "dropped_person_015_020": dropped_person_015_020_count,
+            "dropped_person_020_035": dropped_person_020_035_count,
+            "stage2_ignored_015_020_note": "Stage 2 has low_conf_thresh=0.20, so detections in [0.15, 0.20) are ignored by Stage 2." if reid_min_conf == 0.15 else "N/A",
+        },
+        "possession": possession_res,
+        "ball_tracking": {
+            "frames_with_raw_ball": len(frames_with_raw_ball),
+            "frames_after_select": sum(1 for f in tracks["ball"] if 1 in f),
+            "stabilizer_detected": stab_detected,
+            "stabilizer_interpolated": stab_interp,
+            "stabilizer_lost": stab_lost,
+            "longest_ball_gap_frames": max_gap,
+            "longest_ball_gap_sec": round(max_gap / fps, 2),
+        },
+        "system": {
+            "pass1_time_sec": round(t_pass1, 2),
+            "pass1_fps": round(fps_pass1, 2),
+            "ball_stabilizer_time_ms": round(t_ball * 1000, 2),
+            "pitch_mapping_time_ms": round(t_pitch * 1000, 2),
+            "peak_ram_mb": round(monitor.peak_rss_bytes / (1024 * 1024), 2),
+            "peak_vram_alloc_mb": round(monitor.peak_vram_alloc_bytes / (1024 * 1024), 2),
+        },
+        "tracks": tracks,
     }
 
-    # =========================================================================
-    # CALCULATE METRICS - SYSTEM & RESOURCES
-    # =========================================================================
-    peak_ram_mb = monitor.peak_rss_bytes / (1024 * 1024)
-    peak_vram_alloc_mb = monitor.peak_vram_alloc_bytes / (1024 * 1024)
-    peak_vram_res_mb = monitor.peak_vram_res_bytes / (1024 * 1024)
 
-    metrics["system_performance"] = {
-        "pass1_time_sec": round(t_pass1, 2),
-        "pass1_fps": round(fps_pass1, 2),
-        "ball_stabilizer_time_ms": round(t_ball * 1000, 2),
-        "pitch_mapping_time_ms": round(t_pitch * 1000, 2),
-        "speed_distance_time_ms": round(t_speed * 1000, 2),
-        "player_ball_assign_time_ms": round(t_assign * 1000, 2),
-        "peak_ram_rss_mb": round(peak_ram_mb, 2),
-        "peak_vram_allocated_mb": round(peak_vram_alloc_mb, 2),
-        "peak_vram_reserved_mb": round(peak_vram_res_mb, 2),
-    }
-
-    # Write JSON output
-    os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
-    with open(output_json, "w", encoding="utf-8") as f:
-        json.dump(metrics, f, indent=2, ensure_ascii=False)
-    print(f"\n-> Da xuat file ket qua: {output_json}")
-
-    # =========================================================================
-    # PRINT SUMMARY TABLE
-    # =========================================================================
-    print("\n" + "=" * 80)
-    print("                    BANG SO LIEU BASELINE THUC TE")
+def run_comprehensive_experiment(
+    video_path="video/sample.mp4",
+    model_path=None,
+    calib_path="calib/points.json",
+    batch_size=8,
+    output_report="reports/step1_comparison.json",
+    contact_sheet_dir="reports/contact_sheets",
+):
     print("=" * 80)
-    print(f"{'Hang muc':<45} | {'Gia tri thuc te':<30}")
-    print("-" * 80)
-    print(f"{'1. NGUOI (PERSON TRACKING)':<45} |")
-    print(f"  - So ID Cau thu duy nhat (Unique Player IDs):{'':<3} | {metrics['person_tracking']['unique_player_ids']} IDs (Ly tuong: ~18-22)")
-    print(f"  - So ID Trong tai duy nhat (Unique Ref IDs):{'':<4} | {metrics['person_tracking']['unique_referee_ids']} IDs")
-    print(f"  - Tong so tracklet khoi tao (Allocated):{'':<8} | {metrics['person_tracking']['total_tracklets_allocated']} tracklets")
-    print(f"  - Do dai track trung binh (Mean duration):{'':<6} | {metrics['person_tracking']['mean_track_duration_frames']} frames ({metrics['person_tracking']['mean_track_duration_sec']}s)")
-    print(f"  - Do dai track trung vi (Median duration):{'':<6} | {metrics['person_tracking']['median_track_duration_frames']} frames ({metrics['person_tracking']['median_track_duration_sec']}s)")
-    print(f"  - Track ngan (< 30 frames / 1.2s):{'':<13} | {metrics['person_tracking']['short_tracks_less_30f']} ({metrics['person_tracking']['short_tracks_less_30f']/max(1, metrics['person_tracking']['total_unique_person_ids'])*100:.1f}%)")
-    print(f"  - Track bi phan manh co gap (Fragmented tracks):{'':<1} | {metrics['person_tracking']['fragmented_tracks_count']} tracks ({metrics['person_tracking']['total_internal_gaps']} gaps)")
-    print(f"  - So lan nhay/doi class trong cung 1 track:{'':<4} | {metrics['person_tracking']['class_flip_events_within_tracks']} lan")
-    print(f"  - Detection conf trong [0.15, 0.35) bi loai truoc Re-ID:| {metrics['person_tracking']['dropped_person_conf_015_035']} detections")
-    print(f"    + Player [0.15, 0.35) bi loai:{'':<17} | {metrics['person_tracking']['dropped_person_by_class'].get('player', 0)} detections")
-    print(f"    + Goalkeeper [0.15, 0.30) bi loai:{'':<13} | {metrics['person_tracking']['dropped_person_by_class'].get('goalkeeper', 0)} detections")
-    print(f"    + Referee [0.15, 0.30) bi loai:{'':<16} | {metrics['person_tracking']['dropped_person_by_class'].get('referee', 0)} detections")
-    print("-" * 80)
-    print(f"{'2. BONG (BALL TRACKING & STABILIZER)':<45} |")
-    print(f"  - So frame co detection tho tu YOLO:{'':<11} | {metrics['ball_tracking']['frames_with_raw_ball']}/{total_frames} frames ({metrics['ball_tracking']['frames_with_raw_ball_pct']}%)")
-    print(f"  - So frame sau _select_ball_detection:{'':<9} | {metrics['ball_tracking']['frames_after_select_ball']}/{total_frames} frames ({metrics['ball_tracking']['frames_after_select_ball_pct']}%)")
-    print(f"  - So frame bi gating loai bo (Fallback conf <0.35):| {metrics['ball_tracking']['ball_gating_rejections']} frames")
-    print(f"  - So frame sau Stabilizer co bong (Valid):{'':<5} | {metrics['ball_tracking']['stabilizer_valid_ball_frames']}/{total_frames} frames ({metrics['ball_tracking']['stabilizer_valid_ball_pct']}%)")
-    print(f"    + Detected frames (that):{'':<22} | {metrics['ball_tracking']['stabilizer_detected_frames']} frames")
-    print(f"    + Interpolated frames (noi suy):{'':<15} | {metrics['ball_tracking']['stabilizer_interpolated_frames']} frames")
-    print(f"    + Lost frames (mat dau hoan toan):{'':<13} | {metrics['ball_tracking']['stabilizer_lost_frames']} frames")
-    print(f"  - Khoang mat dau (gap) dai nhat:{'':<15} | {metrics['ball_tracking']['longest_ball_dropout_gap_frames']} frames ({metrics['ball_tracking']['longest_ball_dropout_gap_sec']}s)")
-    print(f"  - So lan doi nguoi giu bong (Turnovers):{'':<8} | {metrics['ball_tracking']['possession_changes_turnovers']} lan ({metrics['ball_tracking']['possession_turnovers_per_min']} lan/phut)")
-    print("-" * 80)
-    print(f"{'3. HE THONG (SYSTEM & RESOURCES)':<45} |")
-    print(f"  - Thoi gian Pass 1 (Throughput):{'':<15} | {metrics['system_performance']['pass1_time_sec']}s ({metrics['system_performance']['pass1_fps']} FPS)")
-    print(f"  - Thoi gian On dinh bong (BallStabilizer):{'':<6} | {metrics['system_performance']['ball_stabilizer_time_ms']} ms")
-    print(f"  - Thoi gian Hieu chuan & Anh xa san (Pitch):{'':<4} | {metrics['system_performance']['pitch_mapping_time_ms']} ms")
-    print(f"  - Dinh bo nho RAM (Peak RSS):{'':<18} | {metrics['system_performance']['peak_ram_rss_mb']} MB (Thoa tieu chi < 300MB)")
-    if torch.cuda.is_available():
-        print(f"  - Dinh VRAM GPU Allocated / Reserved:{'':<9} | {metrics['system_performance']['peak_vram_allocated_mb']} MB / {metrics['system_performance']['peak_vram_reserved_mb']} MB")
-    print("=" * 80 + "\n")
+    print("KHOI CHAY THUC NGHIEM TOAN DIEN 3 THAY DOI (STEP 1 BENCHMARK)")
+    print("=" * 80)
 
-    return metrics
+    # 1. PERSON TRACKING: 3 CONFIGS (Baseline None, 0.20, 0.15)
+    person_configs = [
+        ("Baseline (cu)", None),
+        ("reid_min_conf=0.20", 0.20),
+        ("reid_min_conf=0.15", 0.15),
+    ]
+
+    results_by_conf = {}
+    tracks_for_contact_sheet = None
+
+    for label, min_conf in person_configs:
+        stub_name = f"stubs/track_stubs_reid_{min_conf if min_conf is not None else 'baseline'}.pkl"
+        print(f"\n>>> Dang chay cau hinh: {label} (stub={stub_name})...")
+        res = measure_single_config(
+            video_path=video_path,
+            model_path=model_path,
+            calib_path=calib_path,
+            batch_size=batch_size,
+            reid_min_conf=min_conf,
+            draw_interpolated_ball=True,
+            possession_hysteresis=0,
+            stub_path=stub_name,
+            load_stub=False,
+        )
+        tracks_for_contact_sheet = res["tracks"]
+        # Do not store raw tracks in JSON
+        clean_res = {k: v for k, v in res.items() if k != "tracks"}
+        results_by_conf[label] = clean_res
+
+    # 2. POSSESSION HYSTERESIS: N = 0, 3, 5, 8
+    # Dung luon tracks cua baseline de so sanh cong bang su on dinh cua possession
+    print("\n>>> Dang do cac cau hinh Possession Hysteresis (N = 0, 3, 5, 8)...")
+    baseline_tracks = results_by_conf["Baseline (cu)"]
+    # Lay tracks tu res vua chay
+    poss_tracks_players = tracks_for_contact_sheet["players"]
+    poss_tracks_ball = tracks_for_contact_sheet["ball"]
+
+    possession_experiments = {}
+    for n in [0, 3, 5, 8]:
+        p_stat = compute_possession_stats(poss_tracks_players, poss_tracks_ball, hysteresis=n, fps=25.0)
+        # remove raw lists from summary
+        p_clean = {k: v for k, v in p_stat.items() if k not in ("team_ball_control", "player_control")}
+        possession_experiments[f"Hysteresis N={n}"] = p_clean
+
+    # 3. CONTACT SHEETS
+    print("\n>>> Xuat contact sheets cho cac doan 165-185, 300-350, 510-545...")
+    cs_paths = generate_contact_sheets(
+        video_path=video_path,
+        tracks_dict=tracks_for_contact_sheet,
+        output_dir=contact_sheet_dir,
+        step=5,
+    )
+
+    # 4. GHI FILE JSON
+    all_data = {
+        "person_tracking_comparison": results_by_conf,
+        "possession_hysteresis_comparison": possession_experiments,
+        "contact_sheets": cs_paths,
+    }
+    os.makedirs(os.path.dirname(output_report) or ".", exist_ok=True)
+    with open(output_report, "w", encoding="utf-8") as f:
+        json.dump(all_data, f, indent=2, ensure_ascii=False)
+    print(f"\nDa luu toan bo du lieu thuc nghiem vao: {output_report}")
+
+    return all_data
 
 
 if __name__ == "__main__":
@@ -577,14 +765,14 @@ if __name__ == "__main__":
     parser.add_argument("--model", default=None, help="Path to YOLO model checkpoint")
     parser.add_argument("--calib", default="calib/points.json", help="Path to calibration points JSON")
     parser.add_argument("--batch-size", type=int, default=8, help="Inference batch size")
-    parser.add_argument("--output", default="reports/baseline_metrics.json", help="Output JSON metrics path")
+    parser.add_argument("--output", default="reports/step1_comparison.json", help="Output JSON path")
+    parser.add_argument("--compare-all", action="store_true", default=True, help="Run all 3 changes comparison")
     args = parser.parse_args()
 
-    measure_baseline(
+    run_comprehensive_experiment(
         video_path=args.video,
         model_path=args.model,
         calib_path=args.calib,
         batch_size=args.batch_size,
-        output_json=args.output,
+        output_report=args.output,
     )
-
