@@ -658,10 +658,25 @@ class Tracker:
             )
 
             for _, ball in ball_dict.items():
-                if ball.get("is_interpolated", False):
+                is_interp = ball.get("is_interpolated", False)
+                if is_interp and not self.draw_interpolated_ball:
                     continue
 
                 display_bbox = np.asarray(ball["bbox"], dtype=float).copy()
+
+                if is_interp:
+                    # Vẽ bóng nội suy: vòng rỗng có viền (hollow ring) khác biệt rõ với tam giác đặc của bóng thật
+                    cx = int((display_bbox[0] + display_bbox[2]) / 2)
+                    cy = int((display_bbox[1] + display_bbox[3]) / 2)
+                    cv2.circle(frame, (cx, cy), 9, (0, 215, 255), 2, cv2.LINE_AA)
+                    cv2.circle(frame, (cx, cy), 2, (0, 215, 255), -1, cv2.LINE_AA)
+                    triangle_points = np.array([
+                        [cx, cy - 8],
+                        [cx - 5, cy - 16],
+                        [cx + 5, cy - 16]
+                    ])
+                    cv2.drawContours(frame, [triangle_points], 0, (0, 215, 255), 1, cv2.LINE_AA)
+                    continue
 
                 prev_fi = frame_index - 1
                 previous_ball = previous_ball_dict.get(1) if prev_fi >= 0 else None

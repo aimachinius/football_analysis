@@ -131,6 +131,7 @@ def main(
     generate_minimap=True,
     device=None,
     reid_min_conf=None,
+    draw_interpolated_ball=False,
 ):
     # Xác định tên và đường dẫn lưu video
     if not output_name:
@@ -180,6 +181,7 @@ def main(
         batch_size=batch_size,
         device=target_device,
         reid_min_conf=reid_min_conf,
+        draw_interpolated_ball=draw_interpolated_ball,
     )
     camera_motion = CameraMotion()
     team_assigner = TeamAssigner()
@@ -378,6 +380,11 @@ if __name__ == "__main__":
         default=None,
         help="Ngưỡng lọc confidence riêng trước ReIDTrackerFacade.update (mặc định: None = dùng player_conf/gk_conf/ref_conf)",
     )
+    parser.add_argument(
+        "--draw-interpolated-ball",
+        action="store_true",
+        help="Vẽ bóng nội suy với ký hiệu riêng (vòng tròn rỗng) thay vì ẩn đi (mặc định: False)",
+    )
     args = parser.parse_args()
 
     main(
@@ -393,5 +400,5 @@ if __name__ == "__main__":
         generate_minimap=not args.no_minimap,
         device=args.device,
         reid_min_conf=args.reid_min_conf,
-    )
+        draw_interpolated_ball=args.draw_interpolated_ball,
     )
