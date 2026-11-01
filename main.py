@@ -132,6 +132,7 @@ def main(
     device=None,
     reid_min_conf=None,
     draw_interpolated_ball=False,
+    possession_hysteresis=0,
 ):
     # Xác định tên và đường dẫn lưu video
     if not output_name:
@@ -264,12 +265,10 @@ def main(
 
     # Xác định quyền kiểm soát bóng của từng đội
     team_ball_control = []
-    player_assigner = PlayerBallAssigner()
+    player_assigner = PlayerBallAssigner(hysteresis=possession_hysteresis)
     for frame_num, player_track in enumerate(tracks['players']):
-        assigned_player = -1
-        if 1 in tracks['ball'][frame_num]:
-            ball_bbox = tracks['ball'][frame_num][1]['bbox']
-            assigned_player = player_assigner.assign_ball_to_player(player_track, ball_bbox)
+        ball_bbox = tracks['ball'][frame_num][1]['bbox'] if 1 in tracks['ball'][frame_num] else None
+        assigned_player = player_assigner.assign_ball_to_player(player_track, ball_bbox)
 
         if assigned_player != -1:
             tracks['players'][frame_num][assigned_player]['has_ball'] = True
@@ -385,6 +384,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Vẽ bóng nội suy với ký hiệu riêng (vòng tròn rỗng) thay vì ẩn đi (mặc định: False)",
     )
+    parser.add_argument(
+        "--possession-hysteresis",
+        type=int,
+        default=0,
+        help="Số frame thắng liên tục yêu cầu để đổi chủ bóng (mặc định: 0 = tắt)",
+    )
     args = parser.parse_args()
 
     main(
@@ -401,4 +406,5 @@ if __name__ == "__main__":
         device=args.device,
         reid_min_conf=args.reid_min_conf,
         draw_interpolated_ball=args.draw_interpolated_ball,
+        possession_hysteresis=args.possession_hysteresis,
     )
