@@ -1,0 +1,65 @@
+{
+  "video": {
+    "path": "video/sample.mp4",
+    "total_frames": 750,
+    "fps": 25.0,
+    "duration_sec": 30.0,
+    "duration_min": 0.5,
+    "resolution": "1920x1080"
+  },
+  "person_tracking": {
+    "unique_player_ids": 47,
+    "unique_referee_ids": 12,
+    "total_unique_person_ids": 59,
+    "total_tracklets_allocated": 96,
+    "mean_track_duration_frames": 293.63,
+    "mean_track_duration_sec": 11.75,
+    "median_track_duration_frames": 56.0,
+    "median_track_duration_sec": 2.24,
+    "short_tracks_less_30f": 23,
+    "medium_tracks_30_150f": 11,
+    "long_tracks_over_150f": 25,
+    "fragmented_tracks_count": 33,
+    "total_internal_gaps": 185,
+    "class_flip_events_within_tracks": 0,
+    "class_flip_track_ids": [],
+    "cross_class_id_collisions": 0,
+    "raw_person_detections": 18364,
+    "dropped_person_conf_015_035": 898,
+    "dropped_person_by_class": {
+      "player": 578,
+      "referee": 277,
+      "goalkeeper": 43
+    }
+  },
+  "ball_tracking": {
+    "raw_ball_detections_total": 444,
+    "frames_with_raw_ball": 361,
+    "frames_with_raw_ball_pct": 48.13,
+    "frames_after_select_ball": 280,
+    "frames_after_select_ball_pct": 37.33,
+    "ball_gating_rejections": 78,
+    "ball_in_gate_selections": 260,
+    "ball_out_gate_accepted": 19,
+    "stabilizer_detected_frames": 259,
+    "stabilizer_interpolated_frames": 217,
+    "stabilizer_lost_frames": 274,
+    "stabilizer_valid_ball_frames": 476,
+    "stabilizer_valid_ball_pct": 63.47,
+    "longest_ball_dropout_gap_frames": 97,
+    "longest_ball_dropout_gap_sec": 3.88,
+    "possession_changes_turnovers": 56,
+    "possession_turnovers_per_min": 112.0
+  },
+  "system_performance": {
+    "pass1_time_sec": 95.86,
+    "pass1_fps": 7.82,
+    "ball_stabilizer_time_ms": 60.94,
+    "pitch_mapping_time_ms": 583.69,
+    "speed_distance_time_ms": 10.99,
+    "player_ball_assign_time_ms": 7.27,
+    "peak_ram_rss_mb": 816.28,
+    "peak_vram_allocated_mb": 923.02,
+    "peak_vram_reserved_mb": 2102.0
+  }
+}

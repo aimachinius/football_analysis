@@ -93,3 +93,5 @@ Thumbs.db
 htmlcov/
 coverage.xml
 
+graphify-out
+
