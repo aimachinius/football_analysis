@@ -173,3 +173,4 @@ Cả 5 bộ kiểm thử độc lập trong dự án đều được chạy lạ
 ---
 *Báo cáo được lưu trữ chính thức tại [`reports/STEP1_RESULTS.md`](file:///e:/CV_Football_Analys/reports/STEP1_RESULTS.md).*
 *Hệ thống đã dừng lại và sẵn sàng chờ chỉ dẫn tiếp theo từ bạn.*
+
