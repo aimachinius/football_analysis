@@ -133,6 +133,8 @@ def main(
     reid_min_conf=None,
     draw_interpolated_ball=False,
     possession_hysteresis=0,
+    ball_selector="greedy",
+    ball_imgsz=None,
 ):
     # Xác định tên và đường dẫn lưu video
     if not output_name:
@@ -183,6 +185,8 @@ def main(
         device=target_device,
         reid_min_conf=reid_min_conf,
         draw_interpolated_ball=draw_interpolated_ball,
+        ball_selector=ball_selector,
+        ball_imgsz=ball_imgsz,
     )
     camera_motion = CameraMotion()
     team_assigner = TeamAssigner()
@@ -390,6 +394,18 @@ if __name__ == "__main__":
         default=0,
         help="Số frame thắng liên tục yêu cầu để đổi chủ bóng (mặc định: 0 = tắt)",
     )
+    parser.add_argument(
+        "--ball-selector",
+        choices=["greedy", "viterbi"],
+        default="greedy",
+        help="Bộ chọn bóng: 'greedy' (mặc định cũ) hoặc 'viterbi' (Quy hoạch động toàn cục)",
+    )
+    parser.add_argument(
+        "--ball-imgsz",
+        type=int,
+        default=None,
+        help="Độ phân giải inference YOLO riêng cho lớp bóng (vd: 1920). Mặc định None (dùng chung 1536)",
+    )
     args = parser.parse_args()
 
     main(
@@ -407,4 +423,6 @@ if __name__ == "__main__":
         reid_min_conf=args.reid_min_conf,
         draw_interpolated_ball=args.draw_interpolated_ball,
         possession_hysteresis=args.possession_hysteresis,
+        ball_selector=args.ball_selector,
+        ball_imgsz=args.ball_imgsz,
     )

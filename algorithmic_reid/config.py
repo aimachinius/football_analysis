@@ -38,6 +38,7 @@ class ReIDConfig:
     appearance_gate: float = 0.55         # Maximum allowed Bhattacharyya distance (hard appearance barrier)
     max_velocity_px: float = 35.0         # Max sprint displacement cap (px/frame)
     overlap_occlusion_iou: float = 0.15   # Bbox IoU above which appearance EMA is frozen
+    max_spawn_overlap_iou: float = 0.65   # IoU above which an unmatched detection is treated as duplicate and suppressed
 
     # Kalman filter parameters
     velocity_damping_gamma: float = 0.90  # Exponential decay factor for unobserved track velocity

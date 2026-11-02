@@ -414,9 +414,34 @@ class TrackManager:
         # =====================================================================
         # SPAWN NEW TENTATIVE TRACKS
         # =====================================================================
+        # Include active tracks and recently active confirmed tracks (<=3 frames) to prevent duplicate spawning
+        active_boxes = [
+            t.bbox for t in self.tracks
+            if t.bbox is not None and (
+                t.time_since_update == 0 or
+                (t.state == TrackletState.CONFIRMED and t.time_since_update <= 3)
+            )
+        ]
+        active_boxes_arr = np.array(active_boxes, dtype=np.float64) if len(active_boxes) > 0 else np.empty((0, 4), dtype=np.float64)
+
         for k in range(num_dets):
             if k not in matched_det_indices:
                 if det_confs[k] >= self.config.init_conf_thresh:
+                    # Spawn Guard: Suppress duplicate track spawning if overlapping with an already active track
+                    if len(active_boxes_arr) > 0 and getattr(self.config, "max_spawn_overlap_iou", None) is not None:
+                        b_k = det_boxes[k]
+                        x1 = np.maximum(b_k[0], active_boxes_arr[:, 0])
+                        y1 = np.maximum(b_k[1], active_boxes_arr[:, 1])
+                        x2 = np.minimum(b_k[2], active_boxes_arr[:, 2])
+                        y2 = np.minimum(b_k[3], active_boxes_arr[:, 3])
+                        inter = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+                        area_k = max(1e-4, (b_k[2] - b_k[0]) * (b_k[3] - b_k[1]))
+                        area_act = np.maximum(1e-4, (active_boxes_arr[:, 2] - active_boxes_arr[:, 0]) * (active_boxes_arr[:, 3] - active_boxes_arr[:, 1]))
+                        union = area_k + area_act - inter
+                        ious = np.where(union > 0, inter / union, 0.0)
+                        if np.max(ious) > self.config.max_spawn_overlap_iou:
+                            continue
+
                     new_tid = self._allocate_id()
                     new_track = Tracklet(
                         track_id=new_tid,
@@ -431,6 +456,9 @@ class TrackManager:
                         start_frame=t_now,
                     )
                     self.tracks.append(new_track)
+                    # Dynamically append to active_boxes to protect against same-frame duplicate detections
+                    active_boxes.append(det_boxes[k])
+                    active_boxes_arr = np.array(active_boxes, dtype=np.float64)
 
         # =====================================================================
         # TRACKLET STITCHING

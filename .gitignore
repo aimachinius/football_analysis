@@ -2,7 +2,7 @@
 # Football CV Analysis — .gitignore
 # ============================================================
 
-# === Python Cache ===
+# === Python Cache & Bytecode ===
 __pycache__/
 *.py[cod]
 *.pyo
@@ -10,13 +10,13 @@ __pycache__/
 *.pyc
 *.pdb
 
-# === Virtual Environments ===
+# === Virtual Environments & Secrets ===
 .venv/
 venv/
 env/
 .env
 
-# === Model Weights (large binary — manage separately via DVC/LFS) ===
+# === Model Weights (large binaries — manage separately via DVC/LFS) ===
 *.pt
 *.pth
 *.onnx
@@ -29,46 +29,60 @@ stubs/
 # === Dataset & Raw Data ===
 data/
 NewData/
+data.yaml
 
-# === Input Videos ===
+# === Input & Output Videos ===
 video/
+output/
+*.mp4
+*.avi
+*.mov
+*.mkv
 
-# === Output Videos (keep only milestone outputs) ===
-output/*
-!output/gd4.mp4
-!output/gd4_minimap.mp4
-!output/benchmark_run_optimized.mp4
-!output/benchmark_run_optimized_minimap.mp4
+# === Reports, Diagnostics & Campaign Ledgers ===
+reports/
+FINAL_REPORT.md
+experiment_ledger.md
+research_ledger.md
 
-# === Reports — KEEP (do NOT ignore) ===
-# reports/ is tracked intentionally
-
-# === Agent workspace (internal use only) ===
-.agents/
-
-# === Test & Benchmark Scripts ===
-test_*.py
-test.py
+# === Benchmarks, Baseline & Experiments ===
+benchmark/
+baseline/
+experiments/
 benchmark_*.py
 run_benchmark_*.py
-verify_central_view_real_frame.py
 evaluate_video_stage3.py
+verify_central_view_real_frame.py
 
-# === One-off / Utility Scripts (not part of pipeline) ===
+# === Evaluation, Diagnostic & Labeling Scripts ===
+scripts/
+
+# === Test Suites & Adversarial Stress Tests ===
+test_*.py
+test.py
+tests/
+
+# === One-off / Utility / Non-pipeline Scripts ===
+central_view_geometry.py
 high_frame.py
 extract_frame.py
 checkupdate.py
 
-# === Misc Junk ===
+# === Misc Temp Files, Logs & Image Artifacts ===
 list_comand.txt
 cookies.txt
 *.tmp
 *.log
 *.bak
+*.png
+*.jpg
+*.jpeg
 
-# === Notebook / Analysis Exploratory Dirs ===
+# === Legacy / Exploratory Non-runtime Dirs ===
 analysis/
 detect/
+camera_movement_estimate/
+view_transformer/
 
 # === Build & Packaging Artifacts ===
 *.egg-info/
@@ -76,7 +90,7 @@ dist/
 build/
 *.spec
 
-# === IDE / Editor ===
+# === IDE / Editor Artifacts ===
 .idea/
 .vscode/
 *.suo
@@ -86,12 +100,13 @@ build/
 .DS_Store
 Thumbs.db
 
-# === Testing Infrastructure ===
+# === Testing & Static Analysis Cache ===
 .pytest_cache/
 .mypy_cache/
 .coverage
 htmlcov/
 coverage.xml
 
-graphify-out
-
+# === Knowledge Graph & Agent Workspace ===
+graphify-out/
+.agents/

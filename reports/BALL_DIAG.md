@@ -144,3 +144,4 @@ Số liệu định lượng ở trên đã chứng minh triệt để: **Chiế
 ---
 *Báo cáo được trích xuất hoàn toàn tự động từ dữ liệu thực tế tại [`reports/ball_diagnostics.json`](file:///e:/CV_Football_Analys/reports/ball_diagnostics.json).*  
 *Hệ thống đã dừng lại và sẵn sàng chờ chỉ dẫn tiếp theo từ bạn.*
+

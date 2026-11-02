@@ -27,6 +27,14 @@ class Tracker:
         device=None,
         reid_min_conf=None,
         draw_interpolated_ball=False,
+        ball_selector="greedy",
+        ball_floor=0.05,
+        ball_top_k=5,
+        ball_max_skip_g=30,
+        ball_missing_cost=1.8,
+        ball_birth_cost=1.5,
+        ball_v_max=50.0,
+        ball_imgsz=None,
     ):
         import torch
         if device is None:
@@ -36,6 +44,19 @@ class Tracker:
 
         self.reid_min_conf = reid_min_conf
         self.draw_interpolated_ball = draw_interpolated_ball
+        self.ball_selector = ball_selector
+        self.ball_imgsz = ball_imgsz
+
+        from tracker.viterbi_ball import ViterbiBallSelector, ViterbiConfig
+        viterbi_cfg = ViterbiConfig(
+            floor=ball_floor,
+            top_k=ball_top_k,
+            max_skip_g=ball_max_skip_g,
+            missing_cost=ball_missing_cost,
+            birth_cost=ball_birth_cost,
+            v_max=ball_v_max,
+        )
+        self.viterbi_selector = ViterbiBallSelector(viterbi_cfg)
 
         self.model = YOLO(model_path)   
         self.tracker = ByteTrackTracker(
@@ -91,7 +112,11 @@ class Tracker:
         min_confs = [self.player_conf, self.goalkeeper_conf, self.referee_conf, self.ball_conf]
         if self.reid_min_conf is not None:
             min_confs.append(self.reid_min_conf)
-        self.min_predict_conf = max(0.10, min(min_confs) - 0.05)
+        if self.ball_selector == "viterbi":
+            min_confs.append(self.viterbi_selector.cfg.floor)
+            self.min_predict_conf = max(0.01, min(min_confs))
+        else:
+            self.min_predict_conf = max(0.10, min(min_confs) - 0.05)
 
     def _suppress_cross_class_overlaps(self, det, ids, iou_thresh=0.45):
         """
@@ -193,34 +218,68 @@ class Tracker:
         device = self.device
         batch = []
 
+        separate_ball = (self.ball_imgsz is not None and self.ball_imgsz != 1536)
+
         for frame in list_frame:
             batch.append(frame)
 
             if len(batch) == batch_size:
-                results = self.model.predict(
+                results = list(self.model.predict(
                     source=batch,
-                    stream=True,
+                    stream=False,
                     verbose=False,
                     conf=self.min_predict_conf,
+                    classes=None,
                     device=device,
                     imgsz=1536,
                     agnostic_nms=False
-                )
-                batch = []
-                yield from results
+                ))
+                if separate_ball:
+                    ball_results = list(self.model.predict(
+                        source=batch,
+                        stream=False,
+                        verbose=False,
+                        conf=min(self.ball_conf, 0.05),
+                        classes=[0],
+                        device=device,
+                        imgsz=self.ball_imgsz,
+                        agnostic_nms=False
+                    ))
+                    batch = []
+                    for r, br in zip(results, ball_results):
+                        yield (r, br)
+                else:
+                    batch = []
+                    yield from results
 
         if batch:
-            results = self.model.predict(
+            results = list(self.model.predict(
                 source=batch,
-                stream=True,
+                stream=False,
                 verbose=False,
                 conf=self.min_predict_conf,
+                classes=None,
                 device=device,
                 imgsz=1536,
                 agnostic_nms=False
-            )
-            batch = []
-            yield from results
+            ))
+            if separate_ball:
+                ball_results = list(self.model.predict(
+                    source=batch,
+                    stream=False,
+                    verbose=False,
+                    conf=min(self.ball_conf, 0.05),
+                    classes=[0],
+                    device=device,
+                    imgsz=self.ball_imgsz,
+                    agnostic_nms=False
+                ))
+                batch = []
+                for r, br in zip(results, ball_results):
+                    yield (r, br)
+            else:
+                batch = []
+                yield from results
 
     def process_pass1(
         self,
@@ -259,13 +318,20 @@ class Tracker:
 
         self.track_role_history.clear()
         self.reid_tracker.reset()
-        if camera_motion is not None:
+        if self.ball_selector == "viterbi":
+            self.viterbi_selector.reset()
+        if camera_motion is not None and hasattr(camera_motion, "reset"):
             camera_motion.reset()
 
         prev_boxes = []
         buffered_early_frames = []
 
-        for frame_index, d_frame in enumerate(self.detect_frame(list_frame)):
+        for frame_index, det_item in enumerate(self.detect_frame(list_frame)):
+            if isinstance(det_item, tuple):
+                d_frame, b_res = det_item
+            else:
+                d_frame, b_res = det_item, None
+
             frame = d_frame.orig_img
             if ids is None:
                 ids = {v: k for k, v in d_frame.names.items()}
@@ -273,8 +339,17 @@ class Tracker:
             det = sv.Detections.from_ultralytics(d_frame)
 
             # 1. Quả bóng (lọc riêng)
-            is_ball = det.class_id == ids["ball"]
-            ball_det = det[is_ball]
+            if b_res is not None:
+                ball_det = sv.Detections.from_ultralytics(b_res)
+                # Loại bỏ bóng khỏi det chính để tránh trùng lặp
+                is_not_ball = det.class_id != ids["ball"]
+                det = det[is_not_ball]
+            else:
+                is_ball = det.class_id == ids["ball"]
+                ball_det = det[is_ball]
+
+            if self.ball_selector == "viterbi":
+                self.viterbi_selector.add_frame_candidates(frame_index, ball_det, ids)
 
             # 2. Camera Motion step (dùng prev_boxes từ frame trước)
             G_t = None
@@ -422,6 +497,14 @@ class Tracker:
                     tracks["players"][b_idx][p_id]['team'] = team
                     tracks["players"][b_idx][p_id]['team_color'] = team_assigner.team_colors.get(team, (0, 0, 255))
             buffered_early_frames.clear()
+
+        # Sau Pass 1: Nếu dùng Viterbi DP, chọn lại quỹ đạo bóng toàn cục trên top-K ứng viên trong RAM
+        if self.ball_selector == "viterbi":
+            tracks["ball"] = self.viterbi_selector.select_trajectory(
+                total_frames=len(tracks["players"]),
+                camera_motion=camera_motion,
+                player_tracks=tracks.get("players"),
+            )
 
         if stub_path is not None:
             os.makedirs(os.path.dirname(stub_path) or ".", exist_ok=True)

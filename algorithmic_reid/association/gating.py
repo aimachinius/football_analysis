@@ -126,7 +126,7 @@ def apply_gating_barriers(
 
     for i, t in enumerate(tracks):
         time_lost = max(1, t.time_since_update)
-        max_dist = max(2.0 * max_velocity_px * time_lost, 75.0)
+        max_dist = min(250.0, max(max_velocity_px * time_lost, 90.0))
 
         # Euclidean center distance
         c_x, c_y = float(t.mean[0]), float(t.mean[1])
@@ -134,8 +134,10 @@ def apply_gating_barriers(
         cand_y = (det_boxes[:, 1] + det_boxes[:, 3]) / 2.0
         dist = np.hypot(cand_x - c_x, cand_y - c_y)
 
-        # Gate if Mahalanobis exceeds chi2 AND spatial distance exceeds max_dist
-        spatial_violation = (d_m_sq[i, :] > chi2_gate) & (dist > max_dist)
+        # Teleportation Guard: Physical impossibility to move > max_dist
+        # Also gate if Mahalanobis exceeds chi2 and distance exceeds 75px
+        teleport_violation = (dist > max_dist)
+        spatial_violation = teleport_violation | ((d_m_sq[i, :] > chi2_gate) & (dist > 75.0))
         gated_cost[i, spatial_violation] = inf_cost
 
     return gated_cost
