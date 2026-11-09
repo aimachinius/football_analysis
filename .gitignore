@@ -32,8 +32,11 @@ data.yaml
 
 # === Input & Output Videos ===
 video/
-output/
+output/*
+!output/output_sota.mp4
+!output/output_sota_minimap.mp4
 *.mp4
+!output/output_sota*.mp4
 *.avi
 *.mov
 *.mkv
