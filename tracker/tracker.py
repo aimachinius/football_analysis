@@ -20,21 +20,24 @@ class Tracker:
         player_conf=0.35,
         goalkeeper_conf=0.30,
         referee_conf=0.30,
-        ball_conf=0.20,
+        ball_conf=0.01,
         track_thresh=0.2,
         batch_size=8,
         det_conf=None,  # Hỗ trợ tương thích ngược
         device=None,
         reid_min_conf=None,
-        draw_interpolated_ball=False,
-        ball_selector="greedy",
-        ball_floor=0.05,
-        ball_top_k=5,
+        draw_interpolated_ball=True,
+        ball_selector="viterbi",
+        ball_floor=0.01,
+        ball_top_k=10,
         ball_max_skip_g=30,
-        ball_missing_cost=1.8,
+        ball_missing_cost=2.3,
         ball_birth_cost=1.5,
         ball_v_max=50.0,
-        ball_imgsz=None,
+        ball_enable_gap_reach_limit=True,
+        ball_imgsz=1920,
+        reid_config=None,
+        calib_path="calib/points.json",
     ):
         import torch
         if device is None:
@@ -47,7 +50,8 @@ class Tracker:
         self.ball_selector = ball_selector
         self.ball_imgsz = ball_imgsz
 
-        from tracker.viterbi_ball import ViterbiBallSelector, ViterbiConfig
+        from tracker.viterbi_ball import ViterbiBallSelector, ViterbiConfig, get_pitch_reference_polygon
+        pitch_polygon = get_pitch_reference_polygon(calib_path=calib_path)
         viterbi_cfg = ViterbiConfig(
             floor=ball_floor,
             top_k=ball_top_k,
@@ -55,6 +59,9 @@ class Tracker:
             missing_cost=ball_missing_cost,
             birth_cost=ball_birth_cost,
             v_max=ball_v_max,
+            enable_gap_reach_limit=ball_enable_gap_reach_limit,
+            pitch_polygon=pitch_polygon,
+            pitch_margin_px=50.0,
         )
         self.viterbi_selector = ViterbiBallSelector(viterbi_cfg)
 
@@ -83,12 +90,15 @@ class Tracker:
 
         from algorithmic_reid.reid_tracker_facade import ReIDTrackerFacade
         from algorithmic_reid.config import ReIDConfig
-        reid_cfg = ReIDConfig(
-            fps=fps,
-            high_conf_thresh=player_conf,
-            low_conf_thresh=track_thresh,
-            init_conf_thresh=player_conf,
-        )
+        if reid_config is None:
+            reid_cfg = ReIDConfig(
+                fps=fps,
+                high_conf_thresh=player_conf,
+                low_conf_thresh=track_thresh,
+                init_conf_thresh=player_conf,
+            )
+        else:
+            reid_cfg = reid_config
         self.reid_tracker = ReIDTrackerFacade(config=reid_cfg, fps=fps)
 
         # Thiết lập ngưỡng confidence riêng biệt cho 4 class
@@ -109,7 +119,8 @@ class Tracker:
         self.track_role_history = defaultdict(list)
 
         # Ngưỡng thấp nhất để YOLO predict không bỏ sót class nào
-        min_confs = [self.player_conf, self.goalkeeper_conf, self.referee_conf, self.ball_conf]
+        low_c = getattr(self.reid_tracker.config, "low_conf_thresh", 0.20) if hasattr(self, "reid_tracker") and hasattr(self.reid_tracker, "config") else 0.20
+        min_confs = [self.player_conf, self.goalkeeper_conf, self.referee_conf, self.ball_conf, low_c]
         if self.reid_min_conf is not None:
             min_confs.append(self.reid_min_conf)
         if self.ball_selector == "viterbi":
@@ -118,7 +129,7 @@ class Tracker:
         else:
             self.min_predict_conf = max(0.10, min(min_confs) - 0.05)
 
-    def _suppress_cross_class_overlaps(self, det, ids, iou_thresh=0.45):
+    def _suppress_cross_class_overlaps(self, det, ids, iou_thresh=0.45, min_player_conf=None, min_gk_conf=None, min_ref_conf=None):
         """
         [TẦNG 1]: Khử trùng lặp đa nhãn giữa Cầu thủ - Thủ môn - Trọng tài.
         Quy tắc ưu tiên (Priority Suppression):
@@ -128,9 +139,12 @@ class Tracker:
           - Nếu trùng Goalkeeper & Player -> Xóa Player, giữ Goalkeeper.
           - Nếu cùng loại -> Giữ box có confidence cao hơn.
         """
-        is_player = (det.class_id == ids["player"]) & (det.confidence >= self.player_conf)
-        is_gk = (det.class_id == ids["goalkeeper"]) & (det.confidence >= self.goalkeeper_conf)
-        is_ref = (det.class_id == ids["referee"]) & (det.confidence >= self.referee_conf)
+        p_c = self.player_conf if min_player_conf is None else min_player_conf
+        gk_c = self.goalkeeper_conf if min_gk_conf is None else min_gk_conf
+        ref_c = self.referee_conf if min_ref_conf is None else min_ref_conf
+        is_player = (det.class_id == ids["player"]) & (det.confidence >= p_c)
+        is_gk = (det.class_id == ids["goalkeeper"]) & (det.confidence >= gk_c)
+        is_ref = (det.class_id == ids["referee"]) & (det.confidence >= ref_c)
 
         valid_idx = np.where(is_player | is_gk | is_ref)[0]
         if len(valid_idx) <= 1:
@@ -213,6 +227,61 @@ class Tracker:
             player_tracks=player_tracks,
         )
 
+    def interpolate_player_trajectories(self, tracks, max_gap=15):
+        """
+        [P1 Gap-Fill]: Smooth and linearly interpolate player and referee bounding boxes
+        across short occlusion / detection dropouts (1 <= gap <= max_gap frames).
+        Ensures continuous bounding box representation without flickering.
+        """
+        for cat in ("players", "referees"):
+            cat_list = tracks.get(cat, [])
+            total_frames = len(cat_list)
+            if total_frames < 2:
+                continue
+
+            id_obs = defaultdict(list)
+            for f_idx, frame_data in enumerate(cat_list):
+                for tid, entry in frame_data.items():
+                    if not entry.get("is_interpolated", False):
+                        id_obs[tid].append((f_idx, entry))
+
+            for tid, obs_list in id_obs.items():
+                if len(obs_list) < 2:
+                    continue
+                for i in range(len(obs_list) - 1):
+                    f1, e1 = obs_list[i]
+                    f2, e2 = obs_list[i + 1]
+                    gap = f2 - f1
+                    if 1 < gap <= max_gap:
+                        b1 = np.array(e1["bbox"], dtype=float)
+                        b2 = np.array(e2["bbox"], dtype=float)
+                        # Rào chắn động học: cấm nội suy bước nhảy vận tốc phi thực tế (> 35 px/f)
+                        c1 = ((b1[0] + b1[2]) / 2.0, (b1[1] + b1[3]) / 2.0)
+                        c2 = ((b2[0] + b2[2]) / 2.0, (b2[1] + b2[3]) / 2.0)
+                        vel = np.hypot(c2[0] - c1[0], c2[1] - c1[1]) / float(gap)
+                        if vel > 35.0:
+                            continue
+                        t1 = e1.get("team") if e1.get("team") is not None else e2.get("team")
+                        tc1 = e1.get("team_color") if e1.get("team_color") is not None else e2.get("team_color")
+                        is_gk = e1.get("is_goalkeeper", False) or e2.get("is_goalkeeper", False)
+                        for f in range(f1 + 1, f2):
+                            alpha = float(f - f1) / float(gap)
+                            interp_box = (1.0 - alpha) * b1 + alpha * b2
+                            interp_box_list = interp_box.tolist()
+                            interp_entry = {
+                                "bbox": interp_box_list,
+                                "position": get_foot_position(interp_box_list),
+                                "confidence": 0.5,
+                                "is_interpolated": True,
+                            }
+                            if t1 is not None:
+                                interp_entry["team"] = t1
+                            if tc1 is not None:
+                                interp_entry["team_color"] = tc1
+                            if is_gk:
+                                interp_entry["is_goalkeeper"] = True
+                            cat_list[f][tid] = interp_entry
+
     def detect_frame(self, list_frame):
         batch_size = self.batch_size
         device = self.device
@@ -239,7 +308,7 @@ class Tracker:
                         source=batch,
                         stream=False,
                         verbose=False,
-                        conf=min(self.ball_conf, 0.05),
+                        conf=min(self.ball_conf, 0.01),
                         classes=[0],
                         device=device,
                         imgsz=self.ball_imgsz,
@@ -268,7 +337,7 @@ class Tracker:
                     source=batch,
                     stream=False,
                     verbose=False,
-                    conf=min(self.ball_conf, 0.05),
+                    conf=min(self.ball_conf, 0.01),
                     classes=[0],
                     device=device,
                     imgsz=self.ball_imgsz,
@@ -290,6 +359,8 @@ class Tracker:
         stub_path=None,
         camera_stub_path=None,
         choose_Al=2,
+        pitch_mapper=None,
+        video_path=None,
     ):
         """
         Pass 1 thống nhất với Hệ thống 3 Tầng:
@@ -348,14 +419,14 @@ class Tracker:
                 is_ball = det.class_id == ids["ball"]
                 ball_det = det[is_ball]
 
-            if self.ball_selector == "viterbi":
-                self.viterbi_selector.add_frame_candidates(frame_index, ball_det, ids)
-
             # 2. Camera Motion step (dùng prev_boxes từ frame trước)
             G_t = None
             if camera_motion is not None:
                 camera_motion.step(frame, prev_boxes)
                 G_t = getattr(camera_motion, "G_prev", None)
+
+            if self.ball_selector == "viterbi":
+                self.viterbi_selector.add_frame_candidates(frame_index, ball_det, ids, camera_motion=camera_motion)
 
             # 3. Tracking Engine Selection
             if choose_Al == 0:
@@ -373,9 +444,10 @@ class Tracker:
                     gk_conf = min(self.reid_min_conf, self.goalkeeper_conf)
                     ref_conf = min(self.reid_min_conf, self.referee_conf)
                 else:
-                    p_conf = self.player_conf
-                    gk_conf = self.goalkeeper_conf
-                    ref_conf = self.referee_conf
+                    low_c = getattr(self.reid_tracker.config, "low_conf_thresh", 0.20) if hasattr(self, "reid_tracker") and hasattr(self.reid_tracker, "config") else 0.20
+                    p_conf = min(self.player_conf, low_c)
+                    gk_conf = min(self.goalkeeper_conf, low_c)
+                    ref_conf = min(self.referee_conf, low_c)
 
                 is_person = (
                     ((det.class_id == ids["player"]) & (det.confidence >= p_conf)) |
@@ -383,13 +455,60 @@ class Tracker:
                     ((det.class_id == ids["referee"]) & (det.confidence >= ref_conf))
                 )
                 person_det = det[is_person]
-                tracked = self.reid_tracker.update(person_det, frame=frame, camera_homography=G_t)
+                people = self._suppress_cross_class_overlaps(person_det, ids, iou_thresh=0.45,
+                                                             min_player_conf=p_conf,
+                                                             min_gk_conf=gk_conf,
+                                                             min_ref_conf=ref_conf)
+                H_pitch = None
+                if pitch_mapper is not None:
+                    try:
+                        H_pitch = pitch_mapper.Ht(frame_index)
+                    except Exception:
+                        H_pitch = None
+                elif camera_motion is not None and hasattr(camera_motion, "relocalizer") and getattr(camera_motion.relocalizer, "anchors", None):
+                    first_anchor = next(iter(camera_motion.relocalizer.anchors.values()))
+                    if first_anchor.H_pitch is not None and getattr(camera_motion, "M", None) is not None:
+                        try:
+                            H_pitch = first_anchor.H_pitch @ camera_motion.M
+                        except Exception:
+                            H_pitch = None
+
+                tracked = self.reid_tracker.update(
+                    people,
+                    frame=frame,
+                    camera_homography=G_t,
+                    team_assigner=team_assigner,
+                    pitch_homography=H_pitch,
+                )
 
             players, referees, ball = {}, {}, {}
 
             if choose_Al == 2:
                 players = tracked["players"]
                 referees = tracked["referees"]
+
+                # [Cross-Class Deduplication]: Khử trùng lặp triệt để giữa Player và Referee (IoU >= 0.35)
+                # Đảm bảo 1 cơ thể người tuyệt đối không bao giờ bị gắn song song 2 ID
+                for rid, rdata in list(referees.items()):
+                    r_box = rdata.get("bbox")
+                    if r_box is None:
+                        continue
+                    for pid, pdata in list(players.items()):
+                        p_box = pdata.get("bbox")
+                        if p_box is not None:
+                            x1, y1 = max(r_box[0], p_box[0]), max(r_box[1], p_box[1])
+                            x2, y2 = min(r_box[2], p_box[2]), min(r_box[3], p_box[3])
+                            inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                            a1 = (r_box[2] - r_box[0]) * (r_box[3] - r_box[1])
+                            a2 = (p_box[2] - p_box[0]) * (p_box[3] - p_box[1])
+                            iou = inter / (a1 + a2 - inter + 1e-6)
+                            if iou >= 0.35:
+                                # Trùng lặp: Ưu tiên Referee nếu tự tin hơn hoặc giữ 1 ID duy nhất
+                                if rdata.get("confidence", 0) >= pdata.get("confidence", 0):
+                                    players.pop(pid, None)
+                                else:
+                                    referees.pop(rid, None)
+                                break
             else:
                 # [TẦNG 2] Bỏ phiếu chuỗi thời gian khóa vai trò theo từng ID (Legacy BoT-SORT / ByteTrack)
                 for xyxy, cls_id, tid in zip(tracked.xyxy, tracked.class_id, tracked.tracker_id):
@@ -447,6 +566,11 @@ class Tracker:
             )
 
             # --- 2. Team Assigner step (Phương án A: bảo toàn nguyên bản 100%) ---
+            if team_assigner is not None and referees:
+                for r_id, r_track in referees.items():
+                    if r_track.get("confidence", 0) >= self.referee_conf:
+                        team_assigner.record_referee_color(frame, r_track["bbox"])
+
             if team_assigner is not None:
                 # Chỉ lấy các cầu thủ outfield (loại trừ thủ môn nếu có) để không làm lệch K-Means
                 outfield_players = {
@@ -504,7 +628,17 @@ class Tracker:
                 total_frames=len(tracks["players"]),
                 camera_motion=camera_motion,
                 player_tracks=tracks.get("players"),
+                video_path=video_path,
+                frames=list_frame if isinstance(list_frame, list) else None,
             )
+
+        # [Direction C: Global Tracklet Association]: Chia tách tracklet bất thường & ghép nối toàn cục
+        if getattr(self.reid_tracker.config, "use_gta", False):
+            print("   -> [Post-Process] Đang kích hoạt Direction C: Global Tracklet Association (GTA)...")
+            tracks = self.reid_tracker.postprocess_gta(tracks)
+
+        # [P1 Gap-Fill]: Nội suy mượt các khoảng ngắt ngắn (1 đến 15 frames) để bám sát liên tục không nhấp nháy
+        self.interpolate_player_trajectories(tracks, max_gap=15)
 
         if stub_path is not None:
             os.makedirs(os.path.dirname(stub_path) or ".", exist_ok=True)
@@ -556,19 +690,50 @@ class Tracker:
                 tracked = self.BoTTracker.update(people, frame=d_frame.orig_img)
                 tracked = tracked[tracked.tracker_id != -1]
             else:
+                low_c = getattr(self.reid_tracker.config, "low_conf_thresh", 0.20) if hasattr(self, "reid_tracker") and hasattr(self.reid_tracker, "config") else 0.20
+                p_c = min(self.player_conf, low_c)
+                gk_c = min(self.goalkeeper_conf, low_c)
+                ref_c = min(self.referee_conf, low_c)
                 is_person = (
-                    ((det.class_id == ids["player"]) & (det.confidence >= self.player_conf)) |
-                    ((det.class_id == ids["goalkeeper"]) & (det.confidence >= self.goalkeeper_conf)) |
-                    ((det.class_id == ids["referee"]) & (det.confidence >= self.referee_conf))
+                    ((det.class_id == ids["player"]) & (det.confidence >= p_c)) |
+                    ((det.class_id == ids["goalkeeper"]) & (det.confidence >= gk_c)) |
+                    ((det.class_id == ids["referee"]) & (det.confidence >= ref_c))
                 )
                 person_det = det[is_person]
-                tracked = self.reid_tracker.update(person_det, frame=d_frame.orig_img)
+                people = self._suppress_cross_class_overlaps(person_det, ids, iou_thresh=0.45,
+                                                             min_player_conf=p_c,
+                                                             min_gk_conf=gk_c,
+                                                             min_ref_conf=ref_c)
+                tracked = self.reid_tracker.update(people, frame=d_frame.orig_img)
 
             players, referees, ball = {}, {}, {}
 
             if choose_Al == 2:
                 players = tracked["players"]
                 referees = tracked["referees"]
+
+                # [Cross-Class Deduplication]: Khử trùng lặp triệt để giữa Player và Referee (IoU >= 0.35)
+                # Đảm bảo 1 cơ thể người tuyệt đối không bao giờ bị gắn song song 2 ID
+                for rid, rdata in list(referees.items()):
+                    r_box = rdata.get("bbox")
+                    if r_box is None:
+                        continue
+                    for pid, pdata in list(players.items()):
+                        p_box = pdata.get("bbox")
+                        if p_box is not None:
+                            x1, y1 = max(r_box[0], p_box[0]), max(r_box[1], p_box[1])
+                            x2, y2 = min(r_box[2], p_box[2]), min(r_box[3], p_box[3])
+                            inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+                            a1 = (r_box[2] - r_box[0]) * (r_box[3] - r_box[1])
+                            a2 = (p_box[2] - p_box[0]) * (p_box[3] - p_box[1])
+                            iou = inter / (a1 + a2 - inter + 1e-6)
+                            if iou >= 0.35:
+                                # Trùng lặp: Ưu tiên Referee nếu tự tin hơn hoặc giữ 1 ID duy nhất
+                                if rdata.get("confidence", 0) >= pdata.get("confidence", 0):
+                                    players.pop(pid, None)
+                                else:
+                                    referees.pop(rid, None)
+                                break
             else:
                 for xyxy, cls_id, tid in zip(tracked.xyxy, tracked.class_id, tracked.tracker_id):
                     entry = {"bbox": xyxy.tolist()}
@@ -658,8 +823,8 @@ class Tracker:
                 color,
                 cv2.FILLED
             )
-            label = f"GK{track_id}" if is_gk else f"{track_id}"
-            x1_text = x1_rect + (6 if is_gk else 12)
+            label = "GK" if is_gk else f"{track_id}"
+            x1_text = x1_rect + (11 if is_gk else 12)
             if not is_gk and track_id > 99:
                 x1_text -= 10
             cv2.putText(
@@ -732,7 +897,7 @@ class Tracker:
                     frame = self.draw_triangle(frame, player["bbox"], (0, 0, 255))
 
             for track_id, referee in referee_dict.items():
-                frame = self.draw_ellipse(frame, referee["bbox"], (0, 234, 123), track_id=track_id)
+                frame = self.draw_ellipse(frame, referee["bbox"], (0, 234, 123), track_id=None)
 
             previous_ball_dict = (
                 tracks["ball"][frame_index - 1]
@@ -754,11 +919,12 @@ class Tracker:
                     cv2.circle(frame, (cx, cy), 9, (0, 215, 255), 2, cv2.LINE_AA)
                     cv2.circle(frame, (cx, cy), 2, (0, 215, 255), -1, cv2.LINE_AA)
                     triangle_points = np.array([
-                        [cx, cy - 8],
-                        [cx - 5, cy - 16],
-                        [cx + 5, cy - 16]
+                        [cx, cy - 10],
+                        [cx - 8, cy - 22],
+                        [cx + 8, cy - 22]
                     ])
-                    cv2.drawContours(frame, [triangle_points], 0, (0, 215, 255), 1, cv2.LINE_AA)
+                    cv2.drawContours(frame, [triangle_points], 0, (0, 215, 255), cv2.FILLED)
+                    cv2.drawContours(frame, [triangle_points], 0, (0, 0, 0), 1, cv2.LINE_AA)
                     continue
 
                 prev_fi = frame_index - 1

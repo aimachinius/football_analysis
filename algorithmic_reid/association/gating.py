@@ -29,6 +29,8 @@ def apply_gating_barriers(
     check_appearance: bool = True,
     inf_cost: float = 1e5,
     det_inter_ious: Optional[np.ndarray] = None,
+    det_teams: Optional[np.ndarray] = None,
+    pitch_violations: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
     Applies hard gating barriers in-place (or returning copy) to cost_matrix.
@@ -41,6 +43,10 @@ def apply_gating_barriers(
 
     gated_cost = cost_matrix.copy()
 
+    # 0. Pitch-Metric Physiological Speed Violation (Direction A)
+    if pitch_violations is not None:
+        gated_cost[pitch_violations] = inf_cost
+
     # 1. Species Isolation Barrier (Player != Referee != Goalkeeper)
     for i, t in enumerate(tracks):
         t_cls = t.class_id
@@ -48,9 +54,22 @@ def apply_gating_barriers(
         if np.any(mismatch_mask):
             gated_cost[i, mismatch_mask] = inf_cost
 
-    # 2. Appearance Barrier with Occlusion Awareness
+    # 2. Team Isolation Barrier (Team 1 != Team 2)
+    # Strictly forbids cross-team identity swap (e.g. blue player acquiring white player ID)
+    if det_teams is not None:
+        for i, t in enumerate(tracks):
+            t_team = getattr(t, "assigned_team", 0)
+            if t_team in (1, 2):
+                mismatch_team = (det_teams != t_team) & (det_teams > 0)
+                if np.any(mismatch_team):
+                    gated_cost[i, mismatch_team] = inf_cost
+
+    # 3. Appearance Barrier with Occlusion Awareness
     if check_appearance:
-        track_templates = [t.appearance_template for t in tracks]
+        track_templates = [
+            getattr(t, "clean_template", None) if getattr(t, "clean_template", None) is not None else t.appearance_template
+            for t in tracks
+        ]
         app_dist = batch_bhattacharyya_distance(track_templates, det_features)
 
         # Precompute inter-detection overlap if not provided
@@ -93,31 +112,10 @@ def apply_gating_barriers(
         is_occluded_det = (inter_ious > 0.15)
         in_occlusion = is_occluded_det[None, :] | is_occluded_track[:, None]
 
-        # Relax appearance gate to 0.70 during occlusion
-        effective_gate = np.where(in_occlusion, max(appearance_gate, 0.70), appearance_gate)
+        # In occlusion, slightly relax gate to 0.60, but NEVER bypass completely
+        effective_gate = np.where(in_occlusion, max(appearance_gate, 0.60), appearance_gate)
 
-        # Heading alignment check
-        heading_align = np.ones((M, N), dtype=bool)
-        for i, t in enumerate(tracks):
-            vx, vy = float(t.mean[4]), float(t.mean[5])
-            v_speed = np.hypot(vx, vy)
-            if v_speed >= 2.0:
-                c_x, c_y = float(t.mean[0]), float(t.mean[1])
-                cand_x = (det_boxes[:, 0] + det_boxes[:, 2]) / 2.0
-                cand_y = (det_boxes[:, 1] + det_boxes[:, 3]) / 2.0
-                dx = cand_x - c_x
-                dy = cand_y - c_y
-                dist = np.hypot(dx, dy)
-                non_zero = dist > 2.0
-                if np.any(non_zero):
-                    cos_theta = np.ones(N, dtype=np.float64)
-                    cos_theta[non_zero] = (vx * dx[non_zero] + vy * dy[non_zero]) / (v_speed * dist[non_zero])
-                    heading_align[i, :] = (cos_theta >= -0.2)
-
-        # Bypass appearance gating if in occlusion context and spatial DIoU >= 0.10 and heading aligns
-        bypass_app = in_occlusion & (diou_mat >= 0.10) & heading_align
-
-        app_violation = (app_dist > effective_gate) & ~bypass_app
+        app_violation = (app_dist > effective_gate)
         gated_cost[app_violation] = inf_cost
 
     # 3. Spatial / Mahalanobis Barrier

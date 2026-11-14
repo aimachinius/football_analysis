@@ -46,6 +46,18 @@ class TrackManager:
             appearance_thresh=0.40,
         )
 
+        # Direction B: Deep Re-ID Extractor
+        self.deep_extractor = None
+        if getattr(self.config, "use_deep_reid", False):
+            from ..appearance.deep_reid import DeepReIDExtractor
+            self.deep_extractor = DeepReIDExtractor()
+
+        # Direction C: Global Tracklet Associator
+        self.gta = None
+        if getattr(self.config, "use_gta", False):
+            from .gta_postprocess import GlobalTrackletAssociator
+            self.gta = GlobalTrackletAssociator()
+
         self.tracks: List[Tracklet] = []
         self.next_id: int = 0
         self.frame_count: int = 0
@@ -120,10 +132,12 @@ class TrackManager:
         det_classes: np.ndarray,
         frame: Optional[np.ndarray] = None,
         camera_homography: Optional[np.ndarray] = None,
+        det_teams: Optional[np.ndarray] = None,
+        pitch_homography: Optional[np.ndarray] = None,
     ) -> List[Tracklet]:
         """
         Process single frame detections through multi-stage association cascade.
-        Returns list of active confirmed tracklets for current frame.
+        Returns list of active confirmed tracklets (plus coasting tracklets) for current frame.
         """
         self.frame_count += 1
         t_now = self.frame_count
@@ -137,7 +151,8 @@ class TrackManager:
             for track in self.tracks:
                 track.mark_missed()
             self.tracks = [t for t in self.tracks if t.state != TrackletState.DELETED]
-            return [t for t in self.tracks if t.state == TrackletState.CONFIRMED and t.time_since_update == 0]
+            max_coast = getattr(self.config, "max_coast_frames", 15)
+            return [t for t in self.tracks if t.state == TrackletState.CONFIRMED and t.time_since_update <= max_coast]
 
         # Extract appearance features for detections
         det_features: List[Optional[np.ndarray]] = []
@@ -154,6 +169,11 @@ class TrackManager:
                 feat = None
             det_features.append(feat)
 
+        # Direction B: Deep semantic embeddings
+        det_deep_features = None
+        if self.deep_extractor is not None and frame is not None and num_dets > 0:
+            det_deep_features = self.deep_extractor.extract_crops(frame, det_boxes)
+
         det_measurements = np.array([bbox_to_z(b) for b in det_boxes], dtype=np.float64)
 
         # Precompute inter-detection overlaps to protect appearance update
@@ -169,11 +189,22 @@ class TrackManager:
         low_indices = np.where(low_mask)[0]
 
         # Partition tracks
-        confirmed_active = [t for t in self.tracks if t.state == TrackletState.CONFIRMED and t.time_since_update == 0]
+        # Stage 1 includes active confirmed tracks AND recently lost tracks (<= co_association_window)
+        # to allow simultaneous co-association of crossing players and eliminate crossing ID switches
+        co_assoc_win = getattr(self.config, "co_association_window", 15)
+        stage1_tracks = [
+            t for t in self.tracks
+            if (t.state == TrackletState.CONFIRMED and t.time_since_update == 0)
+            or (t.state in (TrackletState.CONFIRMED, TrackletState.LOST)
+                and 1 <= t.time_since_update <= co_assoc_win
+                and (getattr(t, "in_occlusion", False) or t.hits >= self.config.n_init))
+        ]
+
         confirmed_lost = [
             t for t in self.tracks
             if t.state in (TrackletState.CONFIRMED, TrackletState.LOST)
             and 1 <= t.time_since_update <= self.config.reactivation_window
+            and t not in stage1_tracks
         ]
         tentative_tracks = [t for t in self.tracks if t.state == TrackletState.TENTATIVE]
 
@@ -181,17 +212,28 @@ class TrackManager:
         matched_track_ids = set()
 
         # =====================================================================
-        # STAGE 1: Active Confirmed Tracks <-> High-Confidence Detections
+        # STAGE 1: Stage 1 Tracks (Active + Recently Lost Co-Association) <-> High-Conf Detections
         # =====================================================================
-        if len(confirmed_active) > 0 and len(high_indices) > 0:
+        if len(stage1_tracks) > 0 and len(high_indices) > 0:
             sub_boxes = det_boxes[high_indices]
             sub_feats = [det_features[k] for k in high_indices]
             sub_meas = det_measurements[high_indices]
             sub_classes = det_classes[high_indices]
+            sub_teams = det_teams[high_indices] if det_teams is not None else None
+            sub_deep_feats = [det_deep_features[k] for k in high_indices] if det_deep_features is not None else None
+
+            # Direction A: Pitch metric kinematics
+            pitch_cost_mat = None
+            pitch_viols = None
+            if getattr(self.config, "use_pitch_kinematics", False) and pitch_homography is not None:
+                from ..motion.pitch_kinematics import compute_pitch_cost_and_gating
+                pitch_cost_mat, pitch_viols = compute_pitch_cost_and_gating(
+                    stage1_tracks, sub_boxes, pitch_homography, fps=self.config.fps
+                )
 
             sub_inter_ious = max_inter_ious[high_indices]
             cost_mat = compute_fused_cost_matrix(
-                confirmed_active,
+                stage1_tracks,
                 sub_boxes,
                 sub_feats,
                 sub_meas,
@@ -203,11 +245,15 @@ class TrackManager:
                 use_appearance=(frame is not None),
                 chi2_gate=self.config.mahalanobis_gate,
                 det_inter_ious=sub_inter_ious,
+                det_deep_features=sub_deep_feats,
+                w_deep=self.config.w_deep if getattr(self.config, "use_deep_reid", False) else 0.0,
+                pitch_cost_matrix=pitch_cost_mat,
+                w_pitch=self.config.w_pitch if getattr(self.config, "use_pitch_kinematics", False) else 0.0,
             )
 
             gated_cost = apply_gating_barriers(
                 cost_mat,
-                confirmed_active,
+                stage1_tracks,
                 sub_boxes,
                 sub_classes,
                 sub_feats,
@@ -218,6 +264,8 @@ class TrackManager:
                 max_velocity_px=self.config.max_velocity_px,
                 check_appearance=(frame is not None),
                 det_inter_ious=sub_inter_ious,
+                det_teams=sub_teams,
+                pitch_violations=pitch_viols,
             )
 
             matched_pairs, unmatched_t_idx, unmatched_d_idx = min_cost_matching(
@@ -225,8 +273,10 @@ class TrackManager:
             )
 
             for t_idx, d_sub_idx in matched_pairs:
-                t = confirmed_active[t_idx]
+                t = stage1_tracks[t_idx]
                 real_d_idx = high_indices[d_sub_idx]
+                d_team = int(det_teams[real_d_idx]) if det_teams is not None else 0
+                d_deep = det_deep_features[real_d_idx] if det_deep_features is not None else None
                 t.update(
                     det_boxes[real_d_idx],
                     det_confs[real_d_idx],
@@ -234,6 +284,8 @@ class TrackManager:
                     feature=det_features[real_d_idx],
                     max_inter_iou=float(max_inter_ious[real_d_idx]),
                     frame_idx=t_now,
+                    assigned_team=d_team,
+                    deep_feature=d_deep,
                 )
                 matched_track_ids.add(t.track_id)
                 matched_det_indices.add(real_d_idx)
@@ -241,7 +293,7 @@ class TrackManager:
         # =====================================================================
         # STAGE 2: Remaining Active Confirmed Tracks <-> Low-Confidence Detections
         # =====================================================================
-        remaining_active = [t for t in confirmed_active if t.track_id not in matched_track_ids]
+        remaining_active = [t for t in stage1_tracks if t.track_id not in matched_track_ids and t.time_since_update == 0]
         if len(remaining_active) > 0 and len(low_indices) > 0:
             sub_boxes = det_boxes[low_indices]
             sub_feats = [det_features[k] for k in low_indices]
@@ -304,6 +356,7 @@ class TrackManager:
             sub_feats = [det_features[k] for k in remaining_high]
             sub_meas = det_measurements[remaining_high]
             sub_classes = det_classes[remaining_high]
+            sub_teams = det_teams[remaining_high] if det_teams is not None else None
 
             # In Stage 3 Re-ID: appearance + DIoU are key
             sub_inter_ious = max_inter_ious[remaining_high]
@@ -335,6 +388,7 @@ class TrackManager:
                 max_velocity_px=self.config.max_velocity_px,
                 check_appearance=(frame is not None),
                 det_inter_ious=sub_inter_ious,
+                det_teams=sub_teams,
             )
 
             matched_pairs, _, _ = min_cost_matching(
@@ -344,6 +398,7 @@ class TrackManager:
             for t_idx, d_sub_idx in matched_pairs:
                 t = confirmed_lost[t_idx]
                 real_d_idx = remaining_high[d_sub_idx]
+                d_team = int(det_teams[real_d_idx]) if det_teams is not None else 0
                 t.update(
                     det_boxes[real_d_idx],
                     det_confs[real_d_idx],
@@ -351,6 +406,7 @@ class TrackManager:
                     feature=det_features[real_d_idx],
                     max_inter_iou=float(max_inter_ious[real_d_idx]),
                     frame_idx=t_now,
+                    assigned_team=d_team,
                 )
                 matched_track_ids.add(t.track_id)
                 matched_det_indices.add(real_d_idx)
@@ -414,12 +470,14 @@ class TrackManager:
         # =====================================================================
         # SPAWN NEW TENTATIVE TRACKS
         # =====================================================================
-        # Include active tracks and recently active confirmed tracks (<=3 frames) to prevent duplicate spawning
+        # Protect against spawning duplicate/rogue tracklets (e.g. ID 63 during collisions)
+        # by checking overlap with all confirmed tracks (active and coasting up to 15 frames)
+        max_coast = getattr(self.config, "max_coast_frames", 15)
         active_boxes = [
             t.bbox for t in self.tracks
             if t.bbox is not None and (
                 t.time_since_update == 0 or
-                (t.state == TrackletState.CONFIRMED and t.time_since_update <= 3)
+                (t.state == TrackletState.CONFIRMED and t.time_since_update <= max_coast)
             )
         ]
         active_boxes_arr = np.array(active_boxes, dtype=np.float64) if len(active_boxes) > 0 else np.empty((0, 4), dtype=np.float64)
@@ -427,8 +485,8 @@ class TrackManager:
         for k in range(num_dets):
             if k not in matched_det_indices:
                 if det_confs[k] >= self.config.init_conf_thresh:
-                    # Spawn Guard: Suppress duplicate track spawning if overlapping with an already active track
-                    if len(active_boxes_arr) > 0 and getattr(self.config, "max_spawn_overlap_iou", None) is not None:
+                    # Spawn Guard: Suppress duplicate track spawning if overlapping with an existing track
+                    if len(active_boxes_arr) > 0:
                         b_k = det_boxes[k]
                         x1 = np.maximum(b_k[0], active_boxes_arr[:, 0])
                         y1 = np.maximum(b_k[1], active_boxes_arr[:, 1])
@@ -439,7 +497,15 @@ class TrackManager:
                         area_act = np.maximum(1e-4, (active_boxes_arr[:, 2] - active_boxes_arr[:, 0]) * (active_boxes_arr[:, 3] - active_boxes_arr[:, 1]))
                         union = area_k + area_act - inter
                         ious = np.where(union > 0, inter / union, 0.0)
-                        if np.max(ious) > self.config.max_spawn_overlap_iou:
+
+                        cx_k = (b_k[0] + b_k[2]) / 2.0
+                        cy_k = (b_k[1] + b_k[3]) / 2.0
+                        cx_act = (active_boxes_arr[:, 0] + active_boxes_arr[:, 2]) / 2.0
+                        cy_act = (active_boxes_arr[:, 1] + active_boxes_arr[:, 3]) / 2.0
+                        center_dists = np.hypot(cx_k - cx_act, cy_k - cy_act)
+
+                        spawn_iou_cap = getattr(self.config, "max_spawn_overlap_iou", 0.35)
+                        if np.max(ious) > spawn_iou_cap or (len(center_dists) > 0 and np.min(center_dists) < 40.0):
                             continue
 
                     new_tid = self._allocate_id()
@@ -475,9 +541,11 @@ class TrackManager:
         # Remove deleted tracks
         self.tracks = [t for t in self.tracks if t.state != TrackletState.DELETED]
 
-        # Return confirmed tracks that were active on this frame
-        confirmed_active_now = [
+        # Return confirmed tracks that were active on this frame OR coasting (time_since_update <= max_coast_frames)
+        # to ensure rock-solid continuous tracking without flickering / blinking
+        max_coast = getattr(self.config, "max_coast_frames", 15)
+        confirmed_output = [
             t for t in self.tracks
-            if t.state == TrackletState.CONFIRMED and t.time_since_update == 0
+            if t.state == TrackletState.CONFIRMED and t.time_since_update <= max_coast
         ]
-        return confirmed_active_now
+        return confirmed_output

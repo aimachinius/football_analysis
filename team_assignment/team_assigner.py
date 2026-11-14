@@ -13,6 +13,8 @@ class TeamAssigner:
         self.team_colors = {}
         self.player_team_dict = {}  # Lưu team hiện tại (kết quả đa số)
         self.player_team_history = defaultdict(lambda: deque(maxlen=window_size))
+        self.player_raw_colors = defaultdict(list)  # Lưu mẫu màu áo thực tế (RGB) của từng player_id
+        self.referee_raw_colors = []  # Lưu mẫu màu áo thực tế (RGB) của trọng tài biên/tài chính
         self.window_size = window_size
         self.kmeans = None
 
@@ -83,8 +85,16 @@ class TeamAssigner:
 
         self.kmeans = kmeans
 
+    def record_referee_color(self, frame, referee_bbox):
+        ref_color = self.get_player_color(frame, referee_bbox)
+        if ref_color is not None:
+            self.referee_raw_colors.append(ref_color)
+        return ref_color
+
     def get_player_team(self, frame, player_bbox, player_id):
         player_color = self.get_player_color(frame, player_bbox)
+        if player_color is not None:
+            self.player_raw_colors[player_id].append(player_color)
 
         if player_color is not None and 1 in self.team_colors and 2 in self.team_colors:
             d1 = np.linalg.norm(player_color - self.team_colors[1])

@@ -575,6 +575,21 @@ class CameraMotion:
         self.prev = gray
         return self.M, info
 
+    def to_reference(self, t: int, pts: np.ndarray) -> np.ndarray:
+        """
+        Chuyển đổi toạ độ từ frame t sang hệ quy chiếu tham chiếu của đoạn.
+        Tương thích trực tiếp với interface của CameraMotionResult.
+        """
+        pts = np.asarray(pts, dtype=np.float64).reshape(-1, 2)
+        if t < len(self.Ms):
+            M = self.Ms[t]
+        elif len(self.Ms) > 0:
+            M = self.Ms[-1]
+        else:
+            M = np.eye(3, dtype=np.float64)
+        q = M @ np.vstack([pts.T, np.ones(len(pts))])
+        return (q[:2] / q[2]).T
+
     def get_result(self, stub_path=None):
         """Lấy kết quả chuyển động camera sau khi duyệt hết video."""
         result = CameraMotionResult(

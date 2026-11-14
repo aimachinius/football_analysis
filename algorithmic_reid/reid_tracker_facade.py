@@ -95,12 +95,16 @@ class ReIDTrackerFacade:
         detections: sv.Detections,
         frame: Optional[np.ndarray] = None,
         camera_homography: Optional[np.ndarray] = None,
+        team_assigner: Optional[Any] = None,
+        pitch_homography: Optional[np.ndarray] = None,
     ) -> TrackedDetectionsContainer:
         """
         Update tracker with current frame detections.
         detections: sv.Detections containing xyxy, confidence, class_id
         frame: optional BGR image for multi-zone appearance extraction
         camera_homography: optional 3x3 homography matrix (e.g. from Stage 3 CameraMotion)
+        team_assigner: optional TeamAssigner to enforce team-level identity isolation
+        pitch_homography: optional 3x3 homography matrix to FIFA pitch coordinates (Direction A)
         """
         if len(detections) == 0:
             active_tracks = self.manager.step(
@@ -125,6 +129,26 @@ class ReIDTrackerFacade:
             if detections.class_id is not None
             else np.full(len(det_boxes), self.config.class_player, dtype=np.int32)
         )
+
+        # Precompute per-detection team classification if TeamAssigner is calibrated
+        det_teams = None
+        if (
+            team_assigner is not None
+            and frame is not None
+            and hasattr(team_assigner, "team_colors")
+            and 1 in team_assigner.team_colors
+            and 2 in team_assigner.team_colors
+        ):
+            det_teams = np.zeros(len(det_boxes), dtype=np.int32)
+            tc1 = np.array(team_assigner.team_colors[1], dtype=np.float32)
+            tc2 = np.array(team_assigner.team_colors[2], dtype=np.float32)
+            for i in range(len(det_boxes)):
+                if det_classes[i] in (self.config.class_player, self.config.class_goalkeeper):
+                    c = team_assigner.get_player_color(frame, det_boxes[i])
+                    if c is not None:
+                        d1 = np.linalg.norm(c - tc1)
+                        d2 = np.linalg.norm(c - tc2)
+                        det_teams[i] = 1 if d1 < d2 else 2
 
         # On the very first frame, confirm high-confidence tracks immediately
         if self.manager.frame_count == 0:
@@ -151,6 +175,13 @@ class ReIDTrackerFacade:
                         start_frame=0,
                     )
                     t.state = TrackletState.CONFIRMED
+                    if det_teams is not None and det_teams[k] > 0:
+                        t.assigned_team = int(det_teams[k])
+                    if getattr(self.config, "use_deep_reid", False) and self.manager.deep_extractor is not None and frame is not None:
+                        d_feats = self.manager.deep_extractor.extract_crops(frame, det_boxes[k:k+1])
+                        if d_feats and d_feats[0] is not None:
+                            t.deep_template = d_feats[0].copy()
+                            t.clean_deep_template = d_feats[0].copy()
                     self.manager.tracks.append(t)
 
         active_tracks = self.manager.step(
@@ -159,6 +190,8 @@ class ReIDTrackerFacade:
             det_classes=det_classes,
             frame=frame,
             camera_homography=camera_homography,
+            det_teams=det_teams,
+            pitch_homography=pitch_homography,
         )
 
         players = {}
@@ -172,10 +205,11 @@ class ReIDTrackerFacade:
         for track in active_tracks:
             bbox = track.bbox.tolist()
             tid = int(track.track_id)
-            cls_id = int(track.class_id)
+            cls_id = int(track.get_assigned_class()) if hasattr(track, "get_assigned_class") else int(track.class_id)
             conf = float(track.confidence)
+            is_predicted = getattr(track, "is_predicted", False)
 
-            entry = {"bbox": bbox, "confidence": conf}
+            entry = {"bbox": bbox, "confidence": conf, "is_predicted": is_predicted}
 
             if cls_id == self.config.class_referee:
                 referees[tid] = entry
@@ -202,3 +236,14 @@ class ReIDTrackerFacade:
             tracked_det.tracker_id = np.empty((0,), dtype=np.int32)
 
         return TrackedDetectionsContainer(players=players, referees=referees, tracked_det=tracked_det)
+
+    def postprocess_gta(self, tracks: Dict[str, List[Dict[int, Any]]]) -> Dict[str, List[Dict[int, Any]]]:
+        """
+        Direction C: Global Tracklet Association post-processing.
+        Splits erroneously merged tracklets and globally stitches fragmented tracklets.
+        """
+        if getattr(self.config, "use_gta", False):
+            from .lifecycle.gta_postprocess import GlobalTrackletAssociator
+            gta = GlobalTrackletAssociator()
+            return gta.process(tracks)
+        return tracks

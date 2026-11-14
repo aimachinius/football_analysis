@@ -72,10 +72,14 @@ class SpeedAndDistance_Calc:
 
     def draw_speed_and_distance(self, frames, tracks):
         for frame_num, frame in enumerate(frames):
+            text_entries = []
             for object_name, object_tracks in tracks.items():
                 if object_name == "ball" or object_name == "referees":
                     continue
                 for _, track_info in object_tracks[frame_num].items():
+                    # Không vẽ HUD tốc độ/cự ly lên người thủ môn
+                    if track_info.get("is_goalkeeper", False):
+                        continue
                     if "speed" in track_info:
                         speed = track_info.get("speed", None)
                         distance = track_info.get("distance", None)
@@ -85,10 +89,27 @@ class SpeedAndDistance_Calc:
 
                         bbox = track_info["bbox"]
                         position = get_foot_position(bbox)
-                        position = list(position)
-                        position[1] += 40
+                        pos = [int(position[0]), int(position[1]) + 40]
+                        text_entries.append({
+                            "pos": pos,
+                            "speed": speed,
+                            "distance": distance
+                        })
 
-                        position = tuple(map(int, position))
-                        cv2.putText(frame, f"{speed:.2f} km/h", position, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
-                        cv2.putText(frame, f"{distance:.2f} m", (position[0], position[1] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+            # Cơ chế Chống đè chữ HUD (Anti-Collision HUD):
+            # Sắp xếp theo trục Y và dịch chuyển vị trí nếu 2 cầu thủ đứng sát nhau
+            text_entries.sort(key=lambda item: item["pos"][1])
+            placed_boxes = []
+
+            for entry in text_entries:
+                x, y = entry["pos"][0], entry["pos"][1]
+                box_w, box_h = 90, 42
+                for bx, by in placed_boxes:
+                    if abs(x - bx) < box_w and abs(y - by) < box_h:
+                        y = by + box_h + 4
+
+                placed_boxes.append((x, y))
+                cv2.putText(frame, f"{entry['speed']:.2f} km/h", (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+                cv2.putText(frame, f"{entry['distance']:.2f} m", (x, y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2)
+
             yield frame

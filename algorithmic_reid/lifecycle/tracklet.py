@@ -53,6 +53,20 @@ class Tracklet:
         self.consecutive_hits = 1
         self.age = 1
         self.time_since_update = 0
+        self.is_predicted = False
+
+        # Stable clean appearance template & pre-occlusion momentum
+        self.clean_template = feature.copy() if feature is not None else None
+        self.clean_velocity: Tuple[float, float] = (0.0, 0.0)
+        self.in_occlusion = False
+
+        # Deep Re-ID embedding templates (Direction B)
+        self.deep_template: Optional[np.ndarray] = None
+        self.clean_deep_template: Optional[np.ndarray] = None
+
+        # Team identity and role stabilization
+        self.assigned_team: int = 0
+        self.role_history: List[int] = [class_id]
 
         # Trajectory history: list of (frame_idx, bbox)
         self.history: List[Tuple[int, np.ndarray]] = [(start_frame, bbox.copy())]
@@ -69,10 +83,32 @@ class Tracklet:
         is_observed = (self.time_since_update == 0)
         self.mean, self.covariance = self.kf.predict(self.mean, self.covariance, is_observed=is_observed)
         self.age += 1
+        self.is_predicted = True
 
         if homography is not None:
             from ..motion.motion_predictor import apply_camera_motion_to_tracks
             apply_camera_motion_to_tracks([self], homography)
+
+    def get_assigned_class(self, default_class: int = 2) -> int:
+        """
+        [Tầng 2] Temporal role majority voting with hysteresis.
+        Prevents 1-frame detector classification noise (Player <-> Referee <-> Goalkeeper).
+        """
+        if not self.role_history:
+            return self.class_id
+        total = len(self.role_history)
+        if total < 3:
+            return self.role_history[-1]
+
+        # 3: Referee, 1: Goalkeeper, 2: Player
+        ref_count = self.role_history.count(3)
+        gk_count = self.role_history.count(1)
+
+        if ref_count / total >= 0.25:
+            return 3
+        if gk_count / total >= 0.30:
+            return 1
+        return 2
 
     def update(
         self,
@@ -82,6 +118,8 @@ class Tracklet:
         feature: Optional[np.ndarray] = None,
         max_inter_iou: float = 0.0,
         frame_idx: int = 0,
+        assigned_team: int = 0,
+        deep_feature: Optional[np.ndarray] = None,
     ) -> None:
         """
         Update tracklet with matched detection.
@@ -99,11 +137,42 @@ class Tracklet:
                 max_inter_iou=max_inter_iou,
             )
 
+        # Deep Re-ID update (Direction B)
+        if deep_feature is not None:
+            if self.deep_template is None:
+                self.deep_template = deep_feature.copy()
+            elif not self.in_occlusion and confidence >= 0.45:
+                up_deep = 0.85 * self.deep_template + 0.15 * deep_feature
+                norm = np.linalg.norm(up_deep)
+                self.deep_template = up_deep / norm if norm > 1e-6 else up_deep
+
+        # Clean template preservation & momentum tracking before entering occlusion
+        self.in_occlusion = (max_inter_iou > 0.10)
+        if not self.in_occlusion and feature is not None and confidence >= 0.45:
+            if self.clean_template is None:
+                self.clean_template = feature.copy()
+            else:
+                updated = 0.85 * self.clean_template + 0.15 * feature
+                s = np.sum(updated)
+                self.clean_template = updated / s if s > 1e-6 else updated
+
+            if deep_feature is not None:
+                self.clean_deep_template = deep_feature.copy()
+
+            vx, vy = float(self.mean[4]), float(self.mean[5])
+            if np.hypot(vx, vy) >= 1.5:
+                self.clean_velocity = (vx, vy)
+
+        if assigned_team > 0:
+            self.assigned_team = assigned_team
+
         self.confidence = float(confidence)
         self.class_id = class_id
+        self.role_history.append(int(class_id))
         self.hits += 1
         self.consecutive_hits += 1
         self.time_since_update = 0
+        self.is_predicted = False
         self.last_frame = frame_idx
         self.history.append((frame_idx, bbox.copy()))
 

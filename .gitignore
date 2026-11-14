@@ -21,9 +21,9 @@ env/
 *.onnx
 *.weights
 *.safetensors
-
-# === Stubs / Detection Cache ===
-stubs/
+*.pt
+!best_*.pt
+checkpoints/
 
 # === Dataset & Raw Data ===
 data/
@@ -31,15 +31,24 @@ NewData/
 data.yaml
 
 # === Input & Output Videos ===
-video/
+video/*
+!video/sample*.mp4
 output/*
-!output/output_sota.mp4
-!output/output_sota_minimap.mp4
 *.mp4
-!output/output_sota*.mp4
 *.avi
 *.mov
 *.mkv
+!video/sample*.mp4
+!output/output_sam_7.mp4
+!output/output_sam_15*.mp4
+!output/output_sam_16*.mp4
+!output/output_sample*.mp4
+!output/*minimap.mp4
+
+# === Local Backups, Scratch & Temporary Files ===
+backups/
+scratch/
+test_cmd.txt
 
 # === Reports, Diagnostics & Campaign Ledgers ===
 reports/

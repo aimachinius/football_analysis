@@ -72,6 +72,10 @@ def compute_fused_cost_matrix(
     use_appearance: bool = True,
     chi2_gate: float = 13.28,
     det_inter_ious: Optional[np.ndarray] = None,
+    det_deep_features: Optional[List[Optional[np.ndarray]]] = None,
+    w_deep: float = 0.0,
+    pitch_cost_matrix: Optional[np.ndarray] = None,
+    w_pitch: float = 0.0,
 ) -> np.ndarray:
     """
     Compute normalized fused cost matrix between tracks and detections.
@@ -96,21 +100,45 @@ def compute_fused_cost_matrix(
     d_m_mat = compute_mahalanobis_distance_matrix(kf, tracks, det_measurements)
     c_mot = np.clip(d_m_mat / np.sqrt(chi2_gate), 0.0, 1.0)
 
-    # 3. Appearance Cost
+    # 3. Appearance Cost (Prioritize clean pre-occlusion template during/after collisions)
     if use_appearance:
-        track_templates = [t.appearance_template for t in tracks]
+        track_templates = [
+            getattr(t, "clean_template", None) if (getattr(t, "in_occlusion", False) or t.time_since_update > 0) and getattr(t, "clean_template", None) is not None
+            else t.appearance_template
+            for t in tracks
+        ]
         c_app = batch_bhattacharyya_distance(track_templates, det_features)
-        if det_inter_ious is not None and np.any(det_inter_ious > 0.15):
-            occ_mask = det_inter_ious > 0.15
-            c_app[:, occ_mask] = np.minimum(c_app[:, occ_mask], 0.60)
     else:
         c_app = np.zeros((M, N), dtype=np.float64)
         w_app = 0.0
 
-    # 4. Heading / Motion Direction Cost
+    # 4. Deep Re-ID Cost (Direction B)
+    if det_deep_features is not None and w_deep > 0.0:
+        from ..appearance.deep_reid import batch_deep_cosine_distance
+        track_deep_templates = [
+            getattr(t, "clean_deep_template", None) if (getattr(t, "in_occlusion", False) or t.time_since_update > 0) and getattr(t, "clean_deep_template", None) is not None
+            else getattr(t, "deep_template", None)
+            for t in tracks
+        ]
+        c_deep = batch_deep_cosine_distance(track_deep_templates, det_deep_features)
+    else:
+        c_deep = np.zeros((M, N), dtype=np.float64)
+        w_deep = 0.0
+
+    # 5. Pitch-Metric Kinematics Cost (Direction A)
+    if pitch_cost_matrix is not None and w_pitch > 0.0:
+        c_pitch = np.clip(pitch_cost_matrix, 0.0, 1.0)
+    else:
+        c_pitch = np.zeros((M, N), dtype=np.float64)
+        w_pitch = 0.0
+
+    # 6. Heading / Motion Direction Cost (Observation-Centric Momentum)
     c_dir = np.zeros((M, N), dtype=np.float64)
     for i, t in enumerate(tracks):
         vx, vy = float(t.mean[4]), float(t.mean[5])
+        clean_v = getattr(t, "clean_velocity", (0.0, 0.0))
+        if np.hypot(vx, vy) < 2.0 and np.hypot(clean_v[0], clean_v[1]) >= 1.5:
+            vx, vy = clean_v
         v_speed = np.hypot(vx, vy)
         if v_speed < 2.0:
             continue
@@ -126,9 +154,16 @@ def compute_fused_cost_matrix(
             c_dir[i, valid_dist] = (1.0 - np.clip(cos_theta, -1.0, 1.0)) / 2.0
 
     # Normalize active weights
-    tot_weight = w_diou + w_mot + w_app + w_dir
+    tot_weight = w_diou + w_mot + w_app + w_dir + w_deep + w_pitch
     if tot_weight < 1e-4:
         tot_weight = 1.0
 
-    fused_cost = (w_diou * c_diou + w_mot * c_mot + w_app * c_app + w_dir * c_dir) / tot_weight
+    fused_cost = (
+        w_diou * c_diou
+        + w_mot * c_mot
+        + w_app * c_app
+        + w_dir * c_dir
+        + w_deep * c_deep
+        + w_pitch * c_pitch
+    ) / tot_weight
     return fused_cost

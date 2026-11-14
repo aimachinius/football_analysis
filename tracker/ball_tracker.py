@@ -33,6 +33,10 @@ class BallTrajectoryStabilizer:
         tier2_max_angle_deg: float = 60.0,      # Max direction change for Tier 2 interpolation
         max_smoothing_deviation: float = 2.5,   # Max deviation (px) clamped against raw detection
         interp_confidence: float = 0.30,        # Confidence assigned to interpolated frames
+        enable_ballistic_pass_bridging: bool = True,
+        min_pass_gap: int = 5,
+        max_pass_gap: int = 30,
+        ballistic_gravity_app: float = 0.20,    # px/f^2
     ):
         self.v_max = float(v_max)
         self.max_acc = float(max_acc)
@@ -42,6 +46,10 @@ class BallTrajectoryStabilizer:
         self.tier2_max_angle_deg = float(tier2_max_angle_deg)
         self.max_smoothing_deviation = float(max_smoothing_deviation)
         self.interp_confidence = float(interp_confidence)
+        self.enable_ballistic_pass_bridging = bool(enable_ballistic_pass_bridging)
+        self.min_pass_gap = int(min_pass_gap)
+        self.max_pass_gap = int(max_pass_gap)
+        self.ballistic_gravity_app = float(ballistic_gravity_app)
 
     def process(
         self,
@@ -247,15 +255,53 @@ class BallTrajectoryStabilizer:
             if gap <= 0:
                 continue
 
+            # Kiểm tra điều kiện cầu nối quán tính đạn đạo Parabol cho đường chuyền dài (5-30 frames)
+            is_ballistic_pass = False
+            if (
+                self.enable_ballistic_pass_bridging
+                and self.min_pass_gap <= gap <= self.max_pass_gap
+                and player_tracks is not None
+            ):
+                p_a = stabilized_ref[t_a]
+                p_b = stabilized_ref[t_b]
+                avg_speed = np.linalg.norm(p_b - p_a) / float(gap + 1)
+
+                if 3.0 <= avg_speed <= self.v_max:
+                    raw_a = raw_centers[t_a] if raw_centers[t_a] is not None else self._to_frame(camera_motion, t_a, p_a)
+                    raw_b = raw_centers[t_b] if raw_centers[t_b] is not None else self._to_frame(camera_motion, t_b, p_b)
+
+                    near_a = self._is_near_player(player_tracks, t_a, raw_a, check_body=True)
+                    near_b = self._is_near_player(player_tracks, t_b, raw_b, check_body=True)
+
+                    if near_a and near_b:
+                        is_ballistic_pass = True
+
             if gap <= self.tier1_max_gap:
-                # Tier 1 (1-4 frames): PCHIP monotonic interpolation
-                self._interpolate_segment(
+                # Tier 1 (1-4 frames): PCHIP monotonic interpolation với kiểm tra vận tốc vật lý
+                p_a = stabilized_ref[t_a]
+                p_b = stabilized_ref[t_b]
+                avg_speed = np.linalg.norm(p_b - p_a) / float(gap + 1)
+                if avg_speed <= self.v_max:
+                    self._interpolate_segment(
+                        stabilized_ref,
+                        is_interpolated_mask,
+                        track_states,
+                        t_a,
+                        t_b,
+                        confirmed_indices,
+                    )
+                else:
+                    # avg_speed > v_max: excessive physical speed across gap -> REJECT (remain None / LOST)
+                    pass
+
+            elif is_ballistic_pass:
+                # Cầu nối Quán tính Đạn đạo Parabol (Ballistic Parabolic Bridge)
+                self._interpolate_ballistic_pass(
                     stabilized_ref,
                     is_interpolated_mask,
                     track_states,
                     t_a,
                     t_b,
-                    confirmed_indices,
                 )
 
             elif gap <= self.tier2_max_gap:
@@ -295,6 +341,15 @@ class BallTrajectoryStabilizer:
             else:
                 # Tier 3 (> 10 frames): STRICT NO-OP (remain None / LOST)
                 pass
+
+        # Upper Body Suppression: Hủy bỏ các điểm nội suy rơi vào nửa trên bbox của bất kỳ cầu thủ nào
+        self._suppress_upper_body_interpolations(
+            stabilized_ref,
+            is_interpolated_mask,
+            track_states,
+            camera_motion,
+            player_tracks,
+        )
 
         # ---------------------------------------------------------------------
         # Step 5: Confidence-Weighted Bilateral Smoothing (Clamped <= 2.5 px)
@@ -407,9 +462,13 @@ class BallTrajectoryStabilizer:
             bbox = [cx - half_w, cy - half_h, cx + half_w, cy + half_h]
 
             is_interp = is_interpolated_mask[t]
-            conf = self.interp_confidence if is_interp else (
-                raw_confs[t] if raw_confs[t] is not None else 0.85
-            )
+            st = track_states[t]
+            if st == "BALLISTIC_BRIDGED":
+                conf = 0.35
+            elif is_interp:
+                conf = self.interp_confidence
+            else:
+                conf = raw_confs[t] if raw_confs[t] is not None else 0.85
 
             entry = {
                 "bbox": bbox,
@@ -460,8 +519,9 @@ class BallTrajectoryStabilizer:
         player_tracks: Optional[List[Dict[int, Dict[str, Any]]]],
         t: int,
         ball_center: Optional[np.ndarray],
+        check_body: bool = False,
     ) -> bool:
-        """Check if ball is within foot_proximity_thresh of any player's feet."""
+        """Check if ball is within foot_proximity_thresh of any player's feet (or body if check_body=True)."""
         if player_tracks is None or ball_center is None or t >= len(player_tracks):
             return False
 
@@ -478,11 +538,124 @@ class BallTrajectoryStabilizer:
             d_center = np.linalg.norm(ball_center - foot_center)
             d_left = np.linalg.norm(ball_center - foot_left)
             d_right = np.linalg.norm(ball_center - foot_right)
+            d_min = min(d_center, d_left, d_right)
 
-            if min(d_center, d_left, d_right) <= self.foot_proximity_thresh:
+            if check_body:
+                body_center = np.array([(bbox[0] + bbox[2]) / 2.0, (bbox[1] + bbox[3]) / 2.0])
+                head_center = np.array([(bbox[0] + bbox[2]) / 2.0, bbox[1]])
+                d_body = np.linalg.norm(ball_center - body_center)
+                d_head = np.linalg.norm(ball_center - head_center)
+                d_min = min(d_min, d_body, d_head)
+
+            if d_min <= self.foot_proximity_thresh:
                 return True
 
         return False
+
+    def _interpolate_ballistic_pass(
+        self,
+        positions: List[Optional[np.ndarray]],
+        is_interp_mask: List[bool],
+        track_states: List[str],
+        t_a: int,
+        t_b: int,
+    ):
+        """
+        Nội suy quán tính đạn đạo Parabol (Ballistic Parabolic Bridge) cho đường chuyền bổng.
+        Trong không gian tham chiếu (Reference Plane):
+          - X_ref(tau) = (1 - tau) * X_A + tau * X_B
+          - Y_ref(tau) = (1 - tau) * Y_A + tau * Y_B - 4 * h_apex * tau * (1 - tau)
+          - h_apex = 1/8 * g_app * g^2 (với g = t_b - t_a, g_app = ballistic_gravity_app)
+        """
+        p_a = positions[t_a]
+        p_b = positions[t_b]
+        if p_a is None or p_b is None:
+            return
+
+        g = float(t_b - t_a)
+        if g <= 1:
+            return
+
+        # Độ cao cực đại biểu kiến của vòm đạn đạo (pixel y hướng xuống nên trừ đi để bóng bay lên)
+        h_apex = (1.0 / 8.0) * self.ballistic_gravity_app * (g ** 2)
+
+        for fill_t in range(t_a + 1, t_b):
+            tau = float(fill_t - t_a) / g
+            ix = (1.0 - tau) * p_a[0] + tau * p_b[0]
+            iy = (1.0 - tau) * p_a[1] + tau * p_b[1] - 4.0 * h_apex * tau * (1.0 - tau)
+
+            positions[fill_t] = np.array([ix, iy], dtype=np.float64)
+            is_interp_mask[fill_t] = True
+            track_states[fill_t] = "BALLISTIC_BRIDGED"
+
+    def _suppress_upper_body_interpolations(
+        self,
+        stabilized_ref: List[Optional[np.ndarray]],
+        is_interpolated_mask: List[bool],
+        track_states: List[str],
+        camera_motion: Optional[Any],
+        player_tracks: Optional[List[Dict[int, Dict[str, Any]]]],
+    ):
+        """
+        Head-Zone Suppression:
+        Đối với các điểm nội suy (is_interpolated=True), nếu toạ độ rơi vào vùng đầu (top 20% bbox)
+        của cầu thủ đứng ngoài pha bóng (off-ball bystander), loại bỏ hoàn toàn điểm nội suy đó
+        để dập tắt lỗi bóng đè đầu khán giả / cầu thủ ngoài đường biên.
+        Không loại bỏ nếu cầu thủ là người trực tiếp tham gia pha bóng (kicker/receiver ở 2 đầu đường chuyền).
+        """
+        if player_tracks is None:
+            return
+
+        num_frames = len(stabilized_ref)
+        for t in range(num_frames):
+            if not is_interpolated_mask[t] or stabilized_ref[t] is None:
+                continue
+            if t >= len(player_tracks):
+                continue
+
+            img_center = self._to_frame(camera_motion, t, stabilized_ref[t])
+            ix = float(img_center[0])
+            iy = float(img_center[1])
+
+            players = player_tracks[t]
+            for pid, p_info in players.items():
+                pb = p_info.get("bbox")
+                if pb is None:
+                    continue
+                ph = float(pb[3] - pb[1])
+                # Vùng đầu cầu thủ (Head zone: top 20% bbox)
+                if (pb[0] <= ix <= pb[2]) and (pb[1] <= iy <= pb[1] + 0.20 * ph):
+                    # Kiểm tra xem cầu thủ này có phải là người sút hoặc người nhận ở 2 đầu chuỗi nội suy không
+                    t_start = t
+                    while t_start > 0 and is_interpolated_mask[t_start - 1]:
+                        t_start -= 1
+                    t_start = max(0, t_start - 1)
+
+                    t_end = t
+                    while t_end < num_frames - 1 and is_interpolated_mask[t_end + 1]:
+                        t_end += 1
+                    t_end = min(num_frames - 1, t_end + 1)
+
+                    is_active_participant = False
+                    for end_t in (t_start, t_end):
+                        if end_t < len(player_tracks) and pid in player_tracks[end_t] and stabilized_ref[end_t] is not None:
+                            ep_raw = self._to_frame(camera_motion, end_t, stabilized_ref[end_t])
+                            p_box = player_tracks[end_t][pid].get("bbox")
+                            if p_box is not None:
+                                p_foot = ((p_box[0] + p_box[2]) / 2.0, p_box[3])
+                                p_head = ((p_box[0] + p_box[2]) / 2.0, p_box[1])
+                                if (
+                                    np.hypot(ep_raw[0] - p_foot[0], ep_raw[1] - p_foot[1]) < 120.0
+                                    or np.hypot(ep_raw[0] - p_head[0], ep_raw[1] - p_head[1]) < 120.0
+                                ):
+                                    is_active_participant = True
+                                    break
+
+                    if not is_active_participant:
+                        stabilized_ref[t] = None
+                        is_interpolated_mask[t] = False
+                        track_states[t] = "LOST"
+                        break
 
     def _get_velocity_at(
         self,

@@ -1,0 +1,2 @@
+Sau khi xác định được vấn đề cần làm, thì cần xác định được mục tiêu, nên làm gì, chỉnh chỗ nào, chỉnh cái gì? Và chỉnh như vậy có bị ảnh hưởng đến cái khác không. Đảm bảo các tiêu chí rằng khi chỉnh sửa phải đạt được đúng vấn đề đã đề ra.
++Xác nhận đúng chỗ cần chỉnh giúp không ảnh hưởng chỗ khác và không lan man

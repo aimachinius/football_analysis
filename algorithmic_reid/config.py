@@ -15,6 +15,8 @@ class ReIDConfig:
     n_init: int = 2                       # Consecutive hits to confirm a tentative track (suppresses 1-frame noise)
     max_age: int = 70                     # Max frames to retain lost tracks in buffer
     reactivation_window: int = 30         # Max frame gap for Stage 3 lost track reactivation / stitching
+    max_coast_frames: int = 15            # Max frames to output coasting predicted bbox during dropouts to stop flickering
+    co_association_window: int = 15       # Window to include recently occluded/lost tracks in Stage 1 co-association
 
     # Confidence thresholds
     high_conf_thresh: float = 0.40        # Stage 1 matching minimum confidence
@@ -38,7 +40,15 @@ class ReIDConfig:
     appearance_gate: float = 0.55         # Maximum allowed Bhattacharyya distance (hard appearance barrier)
     max_velocity_px: float = 35.0         # Max sprint displacement cap (px/frame)
     overlap_occlusion_iou: float = 0.15   # Bbox IoU above which appearance EMA is frozen
-    max_spawn_overlap_iou: float = 0.65   # IoU above which an unmatched detection is treated as duplicate and suppressed
+    max_spawn_overlap_iou: float = 0.35   # Strict spawn guard: suppress rogue spawns (e.g. ID 63) inside collision clusters
+    enable_team_gating: bool = True       # Enforce hard cross-team barrier (Team 1 != Team 2)
+
+    # Advanced Multi-Direction Extensions (Directions A, B, C)
+    use_pitch_kinematics: bool = False    # Direction A: 2D Pitch-Metric Kinematics via Homography
+    use_deep_reid: bool = False           # Direction B: Deep Semantic Re-ID Extractor (MobileNetV3)
+    use_gta: bool = True                  # Direction C: Global Tracklet Association Post-Processing (Enabled by default)
+    w_pitch: float = 0.20                 # Weight for Direction A Metric Pitch Cost
+    w_deep: float = 0.35                  # Weight for Direction B Deep Semantic Embedding Cost
 
     # Kalman filter parameters
     velocity_damping_gamma: float = 0.90  # Exponential decay factor for unobserved track velocity

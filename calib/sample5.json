@@ -1,0 +1,84 @@
+{
+  "0": {
+    "halfway_T": [
+      123,
+      231
+    ],
+    "circle_T": [
+      139,
+      311
+    ],
+    "circle_B": [
+      160,
+      408
+    ],
+    "center_spot": [
+      148,
+      355
+    ],
+    "circle_R": [
+      341,
+      336
+    ],
+    "halfway_B": [
+      199,
+      657
+    ],
+    "R_pen_T_front": [
+      679,
+      231
+    ],
+    "R_arc_front": [
+      742,
+      296
+    ],
+    "R_arc_T": [
+      750,
+      269
+    ],
+    "R_arc_B": [
+      858,
+      322
+    ],
+    "corner_TR": [
+      799,
+      191
+    ],
+    "R_pen_T_goalline": [
+      879,
+      218
+    ],
+    "R_six_T_goalline": [
+      958,
+      244
+    ],
+    "R_six_T_front": [
+      892,
+      250
+    ],
+    "R_six_B_front": [
+      1059,
+      312
+    ],
+    "R_six_B_goalline": [
+      1138,
+      302
+    ],
+    "R_post_T": [
+      1005,
+      258
+    ],
+    "R_post_B": [
+      1077,
+      284
+    ],
+    "R_pen_B_front": [
+      996,
+      390
+    ],
+    "R_pen_B_goalline": [
+      1289,
+      352
+    ]
+  }
+}
